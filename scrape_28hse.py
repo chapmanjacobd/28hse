@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import re
 import sys
 import time
@@ -115,15 +116,13 @@ ALLOWED_DISTRICTS = frozenset(
     }
 )
 
-# 28Hse exposes preset buckets. Exact boundaries are enforced below.
+# 28Hse exposes preset buckets. Detail-page filters are enforced locally so
+# listings with incomplete server-side metadata are not excluded prematurely.
 SEARCH_PARAMS = {
     "price": "2,3,4",  # HK$5,000-20,000
     "areaOption": "sales",  # usable/saleable area
     "areaRange": "2,3",  # 300-1,000 sqft
     "roomRange": "1,2,3",
-    "yearRange": "7",  # 30 years or newer; exact age is checked below
-    "floors": "HIGH,MIDDLE",
-    "kitchen_type": "OPEN_KITCHEN",
 }
 
 CSV_FIELDS = [
@@ -142,7 +141,41 @@ CSV_FIELDS = [
     "image_url",
     "url",
     "fetched_at",
+    "enriched_at",
+    "estate",
+    "building_area_sqft",
+    "address",
+    "description",
+    "latitude",
+    "longitude",
+    "rent_includes",
+    "cooking_method",
+    "primary_school_net",
+    "secondary_school_net",
+    "published_at",
+    "updated_at",
+    "expires_at",
+    "image_urls",
 ]
+CARD_FIELDS = [
+    "listing_id",
+    "title",
+    "district",
+    "property_type",
+    "price_hkd",
+    "usable_area_sqft",
+    "bedrooms",
+    "bathrooms",
+    "agency",
+    "image_url",
+    "url",
+    "fetched_at",
+]
+DETAIL_REQUIRED_FIELDS = frozenset(
+    {"floor", "kitchen_type", "building_age_years"}
+)
+DEFAULT_CANDIDATES_PATH = Path("data/28hse_candidates.csv")
+DEFAULT_ENRICHED_CACHE_PATH = Path("data/28hse_enriched.csv")
 
 
 def build_url(page: int, base_url: str = BASE_URL) -> str:
@@ -181,6 +214,50 @@ def first_number(text: str) -> int | None:
 def first_match(text: str, pattern: str) -> int | None:
     match = re.search(pattern, text)
     return int(match.group(1).replace(",", "")) if match else None
+
+
+def parse_json_ld(soup: BeautifulSoup) -> dict[str, Any] | None:
+    for script in soup.find_all("script", attrs={"type": "application/ld+json"}):
+        text = script.string or script.get_text()
+        if not text.strip():
+            continue
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(data, dict):
+            continue
+        json_type = data.get("@type")
+        if json_type == "ItemPage" or (
+            isinstance(json_type, list) and "ItemPage" in json_type
+        ):
+            return data
+    return None
+
+
+def parse_coordinate(value: Any) -> float | None:
+    if isinstance(value, (int, float)):
+        return float(value)
+    if not isinstance(value, str):
+        return None
+    match = re.search(r"-?\d+(?:\.\d+)?", value)
+    return float(match.group(0)) if match else None
+
+
+def parse_image_urls(entity: dict[str, Any]) -> str:
+    images = entity.get("image", [])
+    if isinstance(images, (str, dict)):
+        images = [images]
+    if not isinstance(images, list):
+        return ""
+
+    urls: list[str] = []
+    for image in images:
+        if isinstance(image, str):
+            urls.append(image)
+        elif isinstance(image, dict) and isinstance(image.get("url"), str):
+            urls.append(image["url"])
+    return json.dumps(urls, ensure_ascii=False)
 
 
 def parse_listing(card: BeautifulSoup, fetched_at: str) -> dict[str, Any] | None:
@@ -241,8 +318,44 @@ def parse_listing(card: BeautifulSoup, fetched_at: str) -> dict[str, Any] | None
     }
 
 
-def parse_listing_details(soup: BeautifulSoup) -> dict[str, Any] | None:
+def parse_listing_details(soup: BeautifulSoup) -> dict[str, Any]:
     details: dict[str, Any] = {}
+    item_page = parse_json_ld(soup)
+    entity = item_page.get("mainEntity", {}) if item_page else {}
+    if isinstance(entity, dict):
+        address = entity.get("address")
+        if isinstance(address, dict):
+            address = address.get("streetAddress")
+        if isinstance(address, str):
+            details["address"] = address
+
+        description = entity.get("description")
+        if isinstance(description, str):
+            details["description"] = description
+
+        geo = entity.get("geo")
+        if isinstance(geo, dict):
+            latitude = parse_coordinate(geo.get("latitude"))
+            longitude = parse_coordinate(geo.get("longitude"))
+            if latitude is not None:
+                details["latitude"] = latitude
+            if longitude is not None:
+                details["longitude"] = longitude
+
+        details["image_urls"] = parse_image_urls(
+            entity if entity.get("image") else item_page or {}
+        )
+
+    if item_page:
+        for source_key, output_key in (
+            ("datePublished", "published_at"),
+            ("dateModified", "updated_at"),
+            ("expires", "expires_at"),
+        ):
+            value = item_page.get(source_key)
+            if isinstance(value, str):
+                details[output_key] = value
+
     for row in soup.select("tr"):
         label_node = row.select_one("td.table_left")
         value_node = row.select_one("td.table_right")
@@ -257,16 +370,46 @@ def parse_listing_details(soup: BeautifulSoup) -> dict[str, Any] | None:
             details["floor"] = value
         elif label == "廚房類型":
             details["kitchen_type"] = value
+        elif label == "建築面積":
+            area = first_number(value)
+            if area is not None:
+                details["building_area_sqft"] = area
         elif label == "地區屋苑":
+            if value:
+                details["estate"] = value
             age = first_match(
                 value_node.get_text(" ", strip=True),
                 r"屋苑樓齡\s*:\s*(\d+)\s*年",
             )
             if age is not None:
                 details["building_age_years"] = age
+        elif label == "租金已包":
+            details["rent_includes"] = value
+        elif label == "廚房煮食模式":
+            details["cooking_method"] = value
+        elif label == "小學校網":
+            details["primary_school_net"] = value
+        elif label == "中學校網":
+            details["secondary_school_net"] = value
+        elif label == "物業地址" and value:
+            details.setdefault("address", value)
 
-    required_fields = {"floor", "kitchen_type", "building_age_years"}
-    return details if required_fields <= details.keys() else None
+    if "latitude" not in details or "longitude" not in details:
+        for map_link in soup.select("a.googleMap[href]"):
+            href = map_link.get("href", "")
+            if not isinstance(href, str):
+                continue
+            match = re.search(
+                r"initNearbyMap\(\s*(-?\d+(?:\.\d+)?)\s*,\s*"
+                r"(-?\d+(?:\.\d+)?)",
+                href,
+            )
+            if match:
+                details.setdefault("latitude", float(match.group(1)))
+                details.setdefault("longitude", float(match.group(2)))
+                break
+
+    return details
 
 
 def district_is_allowed(district: str) -> bool:
@@ -279,77 +422,196 @@ def district_is_allowed(district: str) -> bool:
 
 def matches_card_filters(listing: dict[str, Any]) -> bool:
     return (
-        MIN_RENT_HKD <= listing["price_hkd"] <= MAX_RENT_HKD
-        and MIN_AREA_SQFT <= listing["usable_area_sqft"] <= MAX_AREA_SQFT
-        and MIN_BEDROOMS <= listing["bedrooms"] <= MAX_BEDROOMS
-        and district_is_allowed(listing["district"])
+        MIN_RENT_HKD <= int(listing["price_hkd"]) <= MAX_RENT_HKD
+        and MIN_AREA_SQFT
+        <= int(listing["usable_area_sqft"])
+        <= MAX_AREA_SQFT
+        and MIN_BEDROOMS <= int(listing["bedrooms"]) <= MAX_BEDROOMS
+        and district_is_allowed(str(listing["district"]))
     )
 
 
 def matches_filters(listing: dict[str, Any]) -> bool:
+    building_age = listing.get("building_age_years")
+    try:
+        building_age = int(building_age)
+    except (TypeError, ValueError):
+        return False
     return (
         matches_card_filters(listing)
-        and listing["floor"] in ALLOWED_FLOORS
-        and listing["kitchen_type"] == OPEN_KITCHEN
-        and listing["building_age_years"] < MAX_BUILDING_AGE_YEARS
+        and listing.get("floor") in ALLOWED_FLOORS
+        and listing.get("kitchen_type") == OPEN_KITCHEN
+        and building_age < MAX_BUILDING_AGE_YEARS
     )
 
 
-def scrape(max_pages: int | None) -> list[dict[str, Any]]:
+class IncrementalCsvWriter:
+    def __init__(self, path: Path, fieldnames: list[str]) -> None:
+        self.path = path
+        self.fieldnames = fieldnames
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.existing_ids: set[str] = set()
+        has_content = self.path.exists() and self.path.stat().st_size > 0
+        if has_content:
+            with self.path.open("r", encoding="utf-8", newline="") as source:
+                reader = csv.DictReader(source)
+                if reader.fieldnames != fieldnames:
+                    raise RuntimeError(
+                        f"{path} has an incompatible CSV header; use a new path"
+                    )
+                self.existing_ids = {
+                    row["listing_id"] for row in reader if row.get("listing_id")
+                }
+
+        self.output = self.path.open("a", encoding="utf-8", newline="")
+        self.writer = csv.DictWriter(self.output, fieldnames=fieldnames)
+        if not has_content:
+            self.writer.writeheader()
+            self.output.flush()
+            self._sync()
+
+    def _sync(self) -> None:
+        self.output.flush()
+        try:
+            os.fsync(self.output.fileno())
+        except OSError as exc:
+            raise RuntimeError(f"Unable to persist {self.path}: {exc}") from exc
+
+    def append(self, row: dict[str, Any]) -> bool:
+        listing_id = str(row["listing_id"])
+        if listing_id in self.existing_ids:
+            return False
+        self.writer.writerow({field: row.get(field, "") for field in self.fieldnames})
+        self._sync()
+        self.existing_ids.add(listing_id)
+        return True
+
+    def close(self) -> None:
+        self.output.close()
+
+    def __enter__(self) -> "IncrementalCsvWriter":
+        return self
+
+    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
+        self.close()
+
+
+def read_csv_rows(path: Path) -> list[dict[str, str]]:
+    if not path.exists():
+        raise RuntimeError(f"CSV input does not exist: {path}")
+    with path.open("r", encoding="utf-8", newline="") as source:
+        return list(csv.DictReader(source))
+
+
+def scrape(
+    max_pages: int | None,
+    candidates_path: Path,
+    page_limit: int | None = None,
+) -> int:
     fetched_at = datetime.now(timezone.utc).isoformat()
-    results: dict[str, dict[str, Any]] = {}
+    new_candidates = 0
+    pages_scraped = 0
 
-    for district_url in DISTRICT_URLS:
-        page = 1
-        total_items: int | None = None
-        while max_pages is None or page <= max_pages:
-            url = build_url(page, district_url)
-            print(f"downloading page {page}: {url}", file=sys.stderr)
-            soup = BeautifulSoup(fetch_html(url), "html.parser")
-            cards = soup.select("div.listItems div.property_item")
-            try:
-                item_list = parse_item_list(soup)
-            except RuntimeError:
-                if cards:
-                    raise
-                print(f"no listings in district scope: {district_url}", file=sys.stderr)
+    with IncrementalCsvWriter(candidates_path, CARD_FIELDS) as output:
+        for district_url in DISTRICT_URLS:
+            if page_limit is not None and pages_scraped >= page_limit:
                 break
-
-            if total_items is None:
-                total_items = int(item_list["numberOfItems"])
-                total_pages = (total_items + PAGE_SIZE - 1) // PAGE_SIZE
-                print(
-                    f"candidate listings: {total_items}; pages: {total_pages}",
-                    file=sys.stderr,
-                )
-
-            for card in cards:
-                listing = parse_listing(card, fetched_at)
-                if listing is None or not matches_card_filters(listing):
-                    continue
-
-                detail_soup = BeautifulSoup(
-                    fetch_html(listing["url"]), "html.parser"
-                )
-                details = parse_listing_details(detail_soup)
-                if details is None:
+            page = 1
+            total_items: int | None = None
+            while (
+                (max_pages is None or page <= max_pages)
+                and (page_limit is None or pages_scraped < page_limit)
+            ):
+                url = build_url(page, district_url)
+                print(f"downloading page {page}: {url}", file=sys.stderr)
+                soup = BeautifulSoup(fetch_html(url), "html.parser")
+                pages_scraped += 1
+                cards = soup.select("div.listItems div.property_item")
+                try:
+                    item_list = parse_item_list(soup)
+                except RuntimeError:
+                    if cards:
+                        raise
                     print(
-                        f"warning: incomplete listing details skipped: {listing['url']}",
+                        f"no listings in district scope: {district_url}",
                         file=sys.stderr,
                     )
-                    continue
+                    break
 
-                listing.update(details)
-                if matches_filters(listing):
-                    results[listing["listing_id"]] = listing
+                if total_items is None:
+                    total_items = int(item_list["numberOfItems"])
+                    total_pages = (total_items + PAGE_SIZE - 1) // PAGE_SIZE
+                    print(
+                        f"candidate listings: {total_items}; pages: {total_pages}",
+                        file=sys.stderr,
+                    )
+
+                for card in cards:
+                    listing = parse_listing(card, fetched_at)
+                    if listing is not None and matches_card_filters(listing):
+                        if output.append(listing):
+                            new_candidates += 1
+
+                if not cards or (total_items is not None and page * PAGE_SIZE >= total_items):
+                    break
+                page += 1
                 time.sleep(REQUEST_DELAY_SECONDS)
 
-            if not cards or (total_items is not None and page * PAGE_SIZE >= total_items):
-                break
-            page += 1
+    return new_candidates
+
+
+def enrich(
+    candidates_path: Path,
+    output_path: Path,
+    cache_path: Path,
+) -> int:
+    if output_path.resolve() == cache_path.resolve():
+        raise RuntimeError("--output and --cache must be different paths")
+    candidates = read_csv_rows(candidates_path)
+    new_enriched = 0
+    with IncrementalCsvWriter(cache_path, CSV_FIELDS) as cache:
+        for candidate in candidates:
+            listing_id = candidate.get("listing_id", "")
+            if not listing_id or listing_id in cache.existing_ids:
+                continue
+
+            url = candidate.get("url", "")
+            if not url:
+                print(
+                    f"warning: candidate {listing_id} has no detail URL",
+                    file=sys.stderr,
+                )
+                continue
+
+            print(f"enriching listing {listing_id}: {url}", file=sys.stderr)
+            detail_soup = BeautifulSoup(fetch_html(url), "html.parser")
+            details = parse_listing_details(detail_soup)
+            if not details:
+                print(
+                    f"warning: no listing details found: {url}",
+                    file=sys.stderr,
+                )
+                time.sleep(REQUEST_DELAY_SECONDS)
+                continue
+
+            listing: dict[str, Any] = dict(candidate)
+            listing.update(details)
+            listing["enriched_at"] = datetime.now(timezone.utc).isoformat()
+            if cache.append(listing):
+                new_enriched += 1
             time.sleep(REQUEST_DELAY_SECONDS)
 
-    return list(results.values())
+    enriched_rows = read_csv_rows(cache_path)
+    matches = [listing for listing in enriched_rows if matches_filters(listing)]
+    matches.sort(
+        key=lambda item: (
+            int(item["price_hkd"]),
+            item["district"],
+            item["listing_id"],
+        )
+    )
+    write_csv(output_path, matches)
+    return new_enriched
 
 
 def write_csv(path: Path, listings: list[dict[str, Any]]) -> None:
@@ -363,24 +625,58 @@ def write_csv(path: Path, listings: list[dict[str, Any]]) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
+        "stage",
+        nargs="?",
+        choices=("all", "scrape", "enrich"),
+        default="all",
+        help="run scraping, enrichment, or both (default: all)",
+    )
+    parser.add_argument(
         "--output",
         type=Path,
         default=Path("data/28hse_rentals.csv"),
         help="CSV output path (default: data/28hse_rentals.csv)",
     )
     parser.add_argument(
+        "--candidates",
+        type=Path,
+        default=DEFAULT_CANDIDATES_PATH,
+        help="incremental candidate CSV (default: data/28hse_candidates.csv)",
+    )
+    parser.add_argument(
+        "--cache",
+        type=Path,
+        default=DEFAULT_ENRICHED_CACHE_PATH,
+        help="incremental detail cache (default: data/28hse_enriched.csv)",
+    )
+    parser.add_argument(
         "--max-pages",
         type=int,
         help="limit pages per district for a test run; default downloads all pages",
     )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        help="limit total listing pages across all districts",
+    )
     args = parser.parse_args()
     if args.max_pages is not None and args.max_pages < 1:
         parser.error("--max-pages must be at least 1")
+    if args.limit is not None and args.limit < 1:
+        parser.error("--limit must be at least 1")
 
-    listings = scrape(args.max_pages)
-    listings.sort(key=lambda item: (item["price_hkd"], item["district"], item["listing_id"]))
-    write_csv(args.output, listings)
-    print(f"wrote {len(listings)} matching listings to {args.output}")
+    if args.stage in ("all", "scrape"):
+        new_candidates = scrape(args.max_pages, args.candidates, args.limit)
+        print(
+            f"saved {new_candidates} new card-filtered listings to {args.candidates}"
+        )
+
+    if args.stage in ("all", "enrich"):
+        new_enriched = enrich(args.candidates, args.output, args.cache)
+        print(
+            f"enriched {new_enriched} new listings; "
+            f"wrote matching listings to {args.output}"
+        )
 
 
 if __name__ == "__main__":
