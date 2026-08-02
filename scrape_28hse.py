@@ -677,6 +677,14 @@ def enrich(
 
             print(f"enriching listing {listing_id}: {url}", file=sys.stderr)
             detail_soup = BeautifulSoup(fetch_html(url), "html.parser")
+            if parse_json_ld(detail_soup) is None:
+                print(
+                    f"warning: listing {listing_id} no longer available "
+                    f"(detail URL redirected to a non-property page): {url}",
+                    file=sys.stderr,
+                )
+                time.sleep(REQUEST_DELAY_SECONDS)
+                continue
             details = parse_listing_details(detail_soup)
             if not details:
                 print(
