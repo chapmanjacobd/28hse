@@ -71,6 +71,9 @@ MAX_BUILDING_AGE_YEARS = 30
 
 ALLOWED_FLOORS = frozenset({"高層", "中層"})
 OPEN_KITCHEN = "開放式廚房"
+UNKNOWN_DETAIL_VALUES = frozenset(
+    {"", "-", "--", "—", "－", "n/a", "na", "null", "none"}
+)
 ALLOWED_DISTRICTS = frozenset(
     {
         "中環",
@@ -123,6 +126,7 @@ SEARCH_PARAMS = {
     "areaOption": "sales",  # usable/saleable area
     "areaRange": "2,3",  # 300-1,000 sqft
     "roomRange": "1,2,3",
+    "sortBy": "latest",
 }
 
 CSV_FIELDS = [
@@ -171,9 +175,6 @@ CARD_FIELDS = [
     "url",
     "fetched_at",
 ]
-DETAIL_REQUIRED_FIELDS = frozenset(
-    {"floor", "kitchen_type", "building_age_years"}
-)
 DEFAULT_CANDIDATES_PATH = Path("data/28hse_candidates.csv")
 DEFAULT_ENRICHED_CACHE_PATH = Path("data/28hse_enriched.csv")
 
@@ -260,7 +261,7 @@ def parse_image_urls(entity: dict[str, Any]) -> str:
     return json.dumps(urls, ensure_ascii=False)
 
 
-def parse_listing(card: BeautifulSoup, fetched_at: str) -> dict[str, Any] | None:
+def listing_id_from_card(card: BeautifulSoup) -> str | None:
     link = card.select_one('a.detail_page[href*="/property-"]')
     if link is None:
         return None
@@ -269,7 +270,17 @@ def parse_listing(card: BeautifulSoup, fetched_at: str) -> dict[str, Any] | None
     if not isinstance(url, str):
         return None
     id_match = re.search(r"/property-(\d+)", url)
-    if id_match is None:
+    return id_match.group(1) if id_match else None
+
+
+def parse_listing(card: BeautifulSoup, fetched_at: str) -> dict[str, Any] | None:
+    link = card.select_one('a.detail_page[href*="/property-"]')
+    listing_id = listing_id_from_card(card)
+    if link is None or listing_id is None:
+        return None
+
+    url = link.get("href")
+    if not isinstance(url, str):
         return None
 
     price_node = card.select_one("div.extra div.ui.right.floated.green.large.label")
@@ -299,7 +310,7 @@ def parse_listing(card: BeautifulSoup, fetched_at: str) -> dict[str, Any] | None
     )
 
     return {
-        "listing_id": id_match.group(1),
+        "listing_id": listing_id,
         "title": title_link.get_text(" ", strip=True),
         "district": district_links[0].get_text(" ", strip=True)
         if district_links
@@ -420,6 +431,14 @@ def district_is_allowed(district: str) -> bool:
     )
 
 
+def normalized_detail_value(value: Any) -> str:
+    return " ".join(str(value or "").split())
+
+
+def is_unknown_detail_value(value: Any) -> bool:
+    return normalized_detail_value(value).casefold() in UNKNOWN_DETAIL_VALUES
+
+
 def matches_card_filters(listing: dict[str, Any]) -> bool:
     return (
         MIN_RENT_HKD <= int(listing["price_hkd"]) <= MAX_RENT_HKD
@@ -433,15 +452,25 @@ def matches_card_filters(listing: dict[str, Any]) -> bool:
 
 def matches_filters(listing: dict[str, Any]) -> bool:
     building_age = listing.get("building_age_years")
-    try:
-        building_age = int(building_age)
-    except (TypeError, ValueError):
-        return False
+    if not is_unknown_detail_value(building_age):
+        try:
+            building_age = int(building_age)
+        except (TypeError, ValueError):
+            return False
+        age_matches = building_age < MAX_BUILDING_AGE_YEARS
+    else:
+        age_matches = True
+
+    floor = normalized_detail_value(listing.get("floor"))
+    kitchen_type = normalized_detail_value(listing.get("kitchen_type"))
     return (
         matches_card_filters(listing)
-        and listing.get("floor") in ALLOWED_FLOORS
-        and listing.get("kitchen_type") == OPEN_KITCHEN
-        and building_age < MAX_BUILDING_AGE_YEARS
+        and (is_unknown_detail_value(floor) or floor in ALLOWED_FLOORS)
+        and (
+            is_unknown_detail_value(kitchen_type)
+            or kitchen_type == OPEN_KITCHEN
+        )
+        and age_matches
     )
 
 
@@ -518,6 +547,7 @@ def scrape(
                 break
             page = 1
             total_items: int | None = None
+            stop_district = False
             while (
                 (max_pages is None or page <= max_pages)
                 and (page_limit is None or pages_scraped < page_limit)
@@ -547,12 +577,24 @@ def scrape(
                     )
 
                 for card in cards:
+                    listing_id = listing_id_from_card(card)
+                    if listing_id in output.existing_ids:
+                        print(
+                            f"reached cached listing {listing_id}; "
+                            f"stopping district: {district_url}",
+                            file=sys.stderr,
+                        )
+                        stop_district = True
+                        break
+
                     listing = parse_listing(card, fetched_at)
                     if listing is not None and matches_card_filters(listing):
                         if output.append(listing):
                             new_candidates += 1
 
-                if not cards or (total_items is not None and page * PAGE_SIZE >= total_items):
+                if stop_district or not cards or (
+                    total_items is not None and page * PAGE_SIZE >= total_items
+                ):
                     break
                 page += 1
                 time.sleep(REQUEST_DELAY_SECONDS)
@@ -680,4 +722,11 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print(
+            "\ninterrupted; incremental results were saved",
+            file=sys.stderr,
+        )
+        raise SystemExit(130)

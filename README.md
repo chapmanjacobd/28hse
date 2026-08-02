@@ -1,7 +1,7 @@
 # Hong Kong apartment rental downloader
 
 This downloader retrieves 28Hse apartment rental listings using the site's
-public listing pages and applies these exact filters:
+public listing pages and applies these filters:
 
 - HK Island: Central, Sheung Wan, Sai Ying Pun, Shek Tong Tsui, Tin Hau, or
   Tai Hang
@@ -12,18 +12,23 @@ public listing pages and applies these exact filters:
   Kowloon City, To Kwa Wan, Diamond Hill, or Lok Fu
 - New Territories: Tsing Yi, Kwai Chung, Kwai Fong, Tsuen Wan, Tai Wo Hau,
   Sai Kung, or Clear Water Bay
-- open kitchen
-- middle or high floor
+- open kitchen when reported
+- middle or high floor when reported
 - 1, 2, or 3 bedrooms
-- building age under 30 years
+- building age under 30 years when reported
 - HK$7,000 through HK$17,000 monthly rent
 - 400 through 900 sqft usable area
 
 The scraper visits each requested district URL separately, using the site's
-rent, area, and bedroom buckets to reduce crawling before applying the exact
-limits locally. Kitchen, floor, and building-age details are read from each
-listing's detail page because server-side metadata for those fields can be
-incomplete.
+rent, area, bedroom buckets, and latest-first ordering to reduce crawling
+before applying the exact limits locally. It stops a district when it reaches
+an already cached listing, so repeated runs only look for newer listings.
+Kitchen, floor, and building-age details are read from each listing's detail
+page because server-side metadata for those fields can be incomplete.
+
+For detail filters, an empty value or common unavailable placeholder such as
+`--` is treated as unknown and does not exclude a listing. A known value that
+conflicts with a filter still excludes it.
 
 Scraping and detail enrichment are separate, resumable stages. The first stage
 stores card-filtered candidates incrementally in
