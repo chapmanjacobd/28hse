@@ -21,8 +21,13 @@ public listing pages and applies these filters:
 
 The scraper visits each requested district URL separately, using the site's
 rent, area, bedroom buckets, and latest-first ordering to reduce crawling
-before applying the exact limits locally. It stops a district when it reaches
-an already cached listing, so repeated runs only look for newer listings.
+before applying the exact limits locally. Every listing ID seen on any page
+is recorded in a sidecar file next to the candidates CSV (e.g.
+`data/28hse_candidates_seen.txt`), whether or not the card matches the
+filters. Because 28Hse's ordering is not a strict newest-first sort, a
+district is only stopped once an entire page contains listings that have all
+been seen before, so repeated runs only look for newer listings without
+dropping any.
 Kitchen, floor, and building-age details are read from each listing's detail
 page because server-side metadata for those fields can be incomplete.
 

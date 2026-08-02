@@ -525,6 +525,45 @@ class IncrementalCsvWriter:
         self.close()
 
 
+class SeenSet:
+    """Persistent set of every listing ID encountered on any listing page.
+
+    Listing cards that fail the card filters are never written to the
+    candidates CSV, but their IDs must still be remembered so a district can
+    be skipped once an entire page of listings has already been crawled.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._ids: set[str] = set()
+        if self.path.exists():
+            with self.path.open("r", encoding="utf-8") as source:
+                self._ids.update(
+                    line.strip() for line in source if line.strip()
+                )
+        self._output = self.path.open("a", encoding="utf-8")
+
+    def __contains__(self, listing_id: str) -> bool:
+        return listing_id in self._ids
+
+    def add(self, listing_id: str) -> None:
+        if listing_id in self._ids:
+            return
+        self._ids.add(listing_id)
+        self._output.write(listing_id + "\n")
+        self._output.flush()
+
+    def close(self) -> None:
+        self._output.close()
+
+    def __enter__(self) -> "SeenSet":
+        return self
+
+    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
+        self.close()
+
+
 def read_csv_rows(path: Path) -> list[dict[str, str]]:
     if not path.exists():
         raise RuntimeError(f"CSV input does not exist: {path}")
@@ -540,8 +579,11 @@ def scrape(
     fetched_at = datetime.now(timezone.utc).isoformat()
     new_candidates = 0
     pages_scraped = 0
+    seen_path = candidates_path.with_name(candidates_path.stem + "_seen.txt")
 
-    with IncrementalCsvWriter(candidates_path, CARD_FIELDS) as output:
+    with SeenSet(seen_path) as seen, IncrementalCsvWriter(
+        candidates_path, CARD_FIELDS
+    ) as output:
         for district_url in DISTRICT_URLS:
             if page_limit is not None and pages_scraped >= page_limit:
                 break
@@ -576,21 +618,29 @@ def scrape(
                         file=sys.stderr,
                     )
 
+                unparseable_card = False
+                page_unseen = 0
                 for card in cards:
                     listing_id = listing_id_from_card(card)
-                    if listing_id in output.existing_ids:
-                        print(
-                            f"reached cached listing {listing_id}; "
-                            f"stopping district: {district_url}",
-                            file=sys.stderr,
-                        )
-                        stop_district = True
-                        break
+                    if listing_id is None:
+                        unparseable_card = True
+                        continue
+                    if listing_id not in seen:
+                        page_unseen += 1
+                        seen.add(listing_id)
 
                     listing = parse_listing(card, fetched_at)
                     if listing is not None and matches_card_filters(listing):
                         if output.append(listing):
                             new_candidates += 1
+
+                if cards and not unparseable_card and page_unseen == 0:
+                    print(
+                        f"all {len(cards)} listings on page {page} already seen; "
+                        f"stopping district: {district_url}",
+                        file=sys.stderr,
+                    )
+                    stop_district = True
 
                 if stop_district or not cards or (
                     total_items is not None and page * PAGE_SIZE >= total_items
