@@ -118,6 +118,7 @@ ALLOWED_DISTRICTS = frozenset(
         "清水灣",
     }
 )
+EXCLUDED_PROPERTY_TYPES = frozenset({"村屋"})
 
 # 28Hse exposes preset buckets. Detail-page filters are enforced locally so
 # listings with incomplete server-side metadata are not excluded prematurely.
@@ -447,6 +448,7 @@ def matches_card_filters(listing: dict[str, Any]) -> bool:
         <= MAX_AREA_SQFT
         and MIN_BEDROOMS <= int(listing["bedrooms"]) <= MAX_BEDROOMS
         and district_is_allowed(str(listing["district"]))
+        and str(listing["property_type"]) not in EXCLUDED_PROPERTY_TYPES
     )
 
 
