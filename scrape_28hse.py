@@ -421,6 +421,10 @@ def parse_listing_details(soup: BeautifulSoup) -> dict[str, Any]:
                 details.setdefault("longitude", float(match.group(2)))
                 break
 
+    if details.get("latitude") == 0.0 and details.get("longitude") == 0.0:
+        details.pop("latitude", None)
+        details.pop("longitude", None)
+
     return details
 
 
