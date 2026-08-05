@@ -37,7 +37,12 @@ detail page, since listing cards do not reliably report them.
 
 For detail filters, an empty value or common unavailable placeholder such as
 `--` is treated as unknown and does not exclude a listing. A known value that
-conflicts with a filter still excludes it.
+conflicts with a filter still excludes it. The usable area is re-read from
+each listing's detail page and checked against the area limits again, since
+the area shown on a listing card can disagree with the detail page. When the
+detail page omits the usable area, the building area is used as a lower bound:
+a building area below the minimum excludes the listing, because the usable
+area is never larger than the building area.
 
 Scraping and detail enrichment are separate, resumable stages. The first stage
 stores card-filtered candidates incrementally in

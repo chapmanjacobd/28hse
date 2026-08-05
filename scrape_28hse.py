@@ -405,6 +405,10 @@ def parse_listing_details(soup: BeautifulSoup) -> dict[str, Any]:
             details["floor"] = value
         elif label == "廚房類型":
             details["kitchen_type"] = value
+        elif label == "實用面積":
+            area = first_number(value)
+            if area is not None:
+                details["usable_area_sqft"] = area
         elif label == "建築面積":
             area = first_number(value)
             if area is not None:
@@ -508,6 +512,15 @@ def matches_filters(listing: dict[str, Any]) -> bool:
     floor = normalized_detail_value(listing.get("floor"))
     kitchen_type = normalized_detail_value(listing.get("kitchen_type"))
     subletting = normalized_detail_value(listing.get("subletting"))
+    building_area = listing.get("building_area_sqft")
+    if is_unknown_detail_value(building_area):
+        area_matches = True
+    else:
+        try:
+            building_area = int(building_area)
+        except (TypeError, ValueError):
+            return False
+        area_matches = building_area >= MIN_AREA_SQFT
     return (
         matches_card_filters(listing)
         and (is_unknown_detail_value(floor) or floor in ALLOWED_FLOORS)
@@ -517,6 +530,7 @@ def matches_filters(listing: dict[str, Any]) -> bool:
         )
         and SUBLET_MARKER not in subletting
         and age_matches
+        and area_matches
     )
 
 
