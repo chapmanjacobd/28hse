@@ -12,6 +12,8 @@ public listing pages and applies these filters:
   Kowloon City, To Kwa Wan, Diamond Hill, or Lok Fu
 - New Territories: Tsing Yi, Kwai Chung, Kwai Fong, Tsuen Wan, Tai Wo Hau,
   Sai Kung, or Clear Water Bay
+- no village houses (村屋)
+- whole-unit rentals only (excludes listings marked 可分租, e.g. 單位可分租1人)
 - open kitchen when reported
 - middle or high floor when reported
 - 1, 2, or 3 bedrooms
@@ -29,7 +31,9 @@ district is only stopped once an entire page contains listings that have all
 been seen before, so repeated runs only look for newer listings without
 dropping any.
 Kitchen, floor, and building-age details are read from each listing's detail
-page because server-side metadata for those fields can be incomplete.
+page because server-side metadata for those fields can be incomplete. The
+property type (e.g. 村屋) and the subletting marker are also read from the
+detail page, since listing cards do not reliably report them.
 
 For detail filters, an empty value or common unavailable placeholder such as
 `--` is treated as unknown and does not exclude a listing. A known value that

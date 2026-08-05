@@ -119,6 +119,7 @@ ALLOWED_DISTRICTS = frozenset(
     }
 )
 EXCLUDED_PROPERTY_TYPES = frozenset({"村屋"})
+SUBLET_MARKER = "可分租"
 
 # 28Hse exposes preset buckets. Detail-page filters are enforced locally so
 # listings with incomplete server-side metadata are not excluded prematurely.
@@ -154,6 +155,7 @@ CSV_FIELDS = [
     "latitude",
     "longitude",
     "rent_includes",
+    "subletting",
     "cooking_method",
     "primary_school_net",
     "secondary_school_net",
@@ -330,6 +332,27 @@ def parse_listing(card: BeautifulSoup, fetched_at: str) -> dict[str, Any] | None
     }
 
 
+def parse_property_types(soup: BeautifulSoup) -> str:
+    for labels in soup.select("div.ui.labels"):
+        texts = [
+            label.get_text(" ", strip=True)
+            for label in labels.find_all("div", class_="label", recursive=False)
+        ]
+        if texts and texts[0] == "住宅":
+            return "/".join(texts[1:])
+    return ""
+
+
+def parse_subletting(soup: BeautifulSoup) -> str:
+    for row in soup.select("tr"):
+        label_node = row.select_one("td.table_left")
+        if label_node is None or label_node.get_text(" ", strip=True) != "每月租金":
+            continue
+        sub_value = row.select_one("td.table_right div.pairSubValue")
+        return sub_value.get_text(" ", strip=True) if sub_value else ""
+    return ""
+
+
 def parse_listing_details(soup: BeautifulSoup) -> dict[str, Any]:
     details: dict[str, Any] = {}
     item_page = parse_json_ld(soup)
@@ -425,6 +448,13 @@ def parse_listing_details(soup: BeautifulSoup) -> dict[str, Any]:
         details.pop("latitude", None)
         details.pop("longitude", None)
 
+    property_types = parse_property_types(soup)
+    if property_types:
+        details["property_type"] = property_types
+    subletting = parse_subletting(soup)
+    if subletting:
+        details["subletting"] = subletting
+
     return details
 
 
@@ -444,6 +474,14 @@ def is_unknown_detail_value(value: Any) -> bool:
     return normalized_detail_value(value).casefold() in UNKNOWN_DETAIL_VALUES
 
 
+def property_type_is_excluded(property_type: str) -> bool:
+    return any(
+        part in EXCLUDED_PROPERTY_TYPES
+        for part in re.split(r"[/、,，]", property_type)
+        if part
+    )
+
+
 def matches_card_filters(listing: dict[str, Any]) -> bool:
     return (
         MIN_RENT_HKD <= int(listing["price_hkd"]) <= MAX_RENT_HKD
@@ -452,7 +490,7 @@ def matches_card_filters(listing: dict[str, Any]) -> bool:
         <= MAX_AREA_SQFT
         and MIN_BEDROOMS <= int(listing["bedrooms"]) <= MAX_BEDROOMS
         and district_is_allowed(str(listing["district"]))
-        and str(listing["property_type"]) not in EXCLUDED_PROPERTY_TYPES
+        and not property_type_is_excluded(str(listing["property_type"]))
     )
 
 
@@ -469,6 +507,7 @@ def matches_filters(listing: dict[str, Any]) -> bool:
 
     floor = normalized_detail_value(listing.get("floor"))
     kitchen_type = normalized_detail_value(listing.get("kitchen_type"))
+    subletting = normalized_detail_value(listing.get("subletting"))
     return (
         matches_card_filters(listing)
         and (is_unknown_detail_value(floor) or floor in ALLOWED_FLOORS)
@@ -476,6 +515,7 @@ def matches_filters(listing: dict[str, Any]) -> bool:
             is_unknown_detail_value(kitchen_type)
             or kitchen_type == OPEN_KITCHEN
         )
+        and SUBLET_MARKER not in subletting
         and age_matches
     )
 
