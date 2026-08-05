@@ -13,7 +13,11 @@ public listing pages and applies these filters:
 - New Territories: Tsing Yi, Kwai Chung, Kwai Fong, Tsuen Wan, Tai Wo Hau,
   Sai Kung, or Clear Water Bay
 - no village houses (村屋)
-- whole-unit rentals only (excludes listings marked 可分租, e.g. 單位可分租1人)
+- whole-unit rentals only: listings whose title, description, or sublet marker
+  contains an unambiguous shared-rental term (分租, 合租, 夾租, 租一間, 床位,
+  單間, 室友, 限女/限男, 共用) are excluded
+- ambiguous wording (套房, 兩房一廳, 宿舍, 包水電, 獨立水電錶, ...) does not
+  exclude a listing; it is flagged on the output so it can be reviewed
 - open kitchen when reported
 - middle or high floor when reported
 - 1, 2, or 3 bedrooms
@@ -34,6 +38,13 @@ Kitchen, floor, and building-age details are read from each listing's detail
 page because server-side metadata for those fields can be incomplete. The
 property type (e.g. 村屋) and the subletting marker are also read from the
 detail page, since listing cards do not reliably report them.
+
+Each output row carries a `sharing_type` (`whole`, `shared`, or `ambiguous`)
+and a `sharing_terms` column listing the phrases that matched. `shared`
+listings are excluded from the output; `ambiguous` listings are kept but
+flagged for manual review. Negative phrases such as 不可分租 or 無需合租 are
+ignored so they are not mistaken for shared-rental markers, and 適合租客 /
+適合住客 do not match 合租.
 
 For detail filters, an empty value or common unavailable placeholder such as
 `--` is treated as unknown and does not exclude a listing. A known value that

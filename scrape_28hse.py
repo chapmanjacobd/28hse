@@ -119,7 +119,76 @@ ALLOWED_DISTRICTS = frozenset(
     }
 )
 EXCLUDED_PROPERTY_TYPES = frozenset({"村屋"})
-SUBLET_MARKER = "可分租"
+
+# Shared/co-rental detection. Listings matching a SHARED_PATTERNS pattern are
+# excluded; ambiguous wording is only flagged on the output CSV for review.
+# Negatives like 不可分租 or 無需合租 are stripped first so they do not
+# accidentally match the 分租 / 合租 markers.
+NEGATIVE_SHARED_PHRASES = (
+    "不可分租",
+    "不能分租",
+    "不設分租",
+    "不允分租",
+    "不接受分租",
+    "禁止分租",
+    "拒絕分租",
+    "免分租",
+    "不分租",
+    "無需合租",
+    "不用合租",
+    "不需合租",
+    "免合租",
+    "不設合租",
+)
+# (pattern, label) pairs; patterns may be plain substrings or regexes.
+SHARED_PATTERNS = (
+    ("分租", "分租"),
+    (r"(?<!適)合租", "合租"),
+    ("夾租", "夾租"),
+    ("租一間", "租一間"),
+    (r"(?<!放)床位(?!置)", "床位"),
+    ("單間", "單間"),
+    ("室友", "室友"),
+    ("限女", "限女"),
+    ("限男", "限男"),
+    ("共用", "共用"),
+)
+WHOLE_MARKERS = frozenset(
+    {
+        "全租",
+        "整套出租",
+        "整間出租",
+        "整租",
+        "獨立單位",
+        "獨享",
+    }
+)
+AMBIGUOUS_MARKERS = frozenset(
+    {
+        "唐樓分層出租",
+        "分層出租",
+        "套房",
+        "兩房一廳",
+        "二房一廳",
+        "2房1廳",
+        "兩房兩廳",
+        "可住1人",
+        "可住一人",
+        "包水電",
+        "水電全包",
+        "水電費全包",
+        "獨立水電錶",
+        "獨立電錶",
+        "獨立水錶",
+        "宿舍",
+    }
+)
+# 2-bedroom layouts (兩房一廳, 2房1廳, ...): usually a whole flat, but
+# sometimes only one room of it is being rented.
+ROOM_LAYOUT_PATTERN = re.compile(
+    r"[2２兩二]\s*房\s*"
+    r"[0-9０-９一二兩三四五六七八九十]+\s*廳"
+)
 
 # 28Hse exposes preset buckets. Detail-page filters are enforced locally so
 # listings with incomplete server-side metadata are not excluded prematurely.
@@ -163,6 +232,11 @@ CSV_FIELDS = [
     "updated_at",
     "expires_at",
     "image_urls",
+]
+OUTPUT_FIELDS = [
+    *CSV_FIELDS,
+    "sharing_type",
+    "sharing_terms",
 ]
 CARD_FIELDS = [
     "listing_id",
@@ -486,6 +560,45 @@ def property_type_is_excluded(property_type: str) -> bool:
     )
 
 
+def classify_sharing(listing: dict[str, Any]) -> tuple[str, list[str]]:
+    """Classify a listing as whole-unit, shared, or ambiguous.
+
+    Shared markers (分租, 合租, 夾租, 租一間, 床位, 單間, 室友, 限女/限男,
+    共用) exclude the listing. Ambiguous wording (套房, 兩房一廳, 包水電,
+    獨立水電錶, ...) is returned as "ambiguous" so the row is kept but flagged
+    for manual review. Listings without any marker default to "whole".
+    Returns (sharing_type, matched_terms).
+    """
+    text = " ".join(
+        normalized_detail_value(listing.get(field))
+        for field in ("title", "description", "subletting")
+    )
+    for phrase in NEGATIVE_SHARED_PHRASES:
+        text = text.replace(phrase, "")
+
+    shared_terms = [
+        label
+        for pattern, label in SHARED_PATTERNS
+        if re.search(pattern, text)
+    ]
+    if shared_terms:
+        return "shared", shared_terms
+
+    whole_terms = [marker for marker in WHOLE_MARKERS if marker in text]
+    if whole_terms:
+        return "whole", whole_terms
+
+    ambiguous_terms = [marker for marker in AMBIGUOUS_MARKERS if marker in text]
+    for match in ROOM_LAYOUT_PATTERN.finditer(text):
+        layout = match.group(0).replace(" ", "")
+        if layout not in ambiguous_terms:
+            ambiguous_terms.append(layout)
+    if ambiguous_terms:
+        return "ambiguous", ambiguous_terms
+
+    return "whole", []
+
+
 def matches_card_filters(listing: dict[str, Any]) -> bool:
     return (
         MIN_RENT_HKD <= int(listing["price_hkd"]) <= MAX_RENT_HKD
@@ -511,8 +624,8 @@ def matches_filters(listing: dict[str, Any]) -> bool:
 
     floor = normalized_detail_value(listing.get("floor"))
     kitchen_type = normalized_detail_value(listing.get("kitchen_type"))
-    subletting = normalized_detail_value(listing.get("subletting"))
     building_area = listing.get("building_area_sqft")
+    sharing_type, _ = classify_sharing(listing)
     if is_unknown_detail_value(building_area):
         area_matches = True
     else:
@@ -528,7 +641,7 @@ def matches_filters(listing: dict[str, Any]) -> bool:
             is_unknown_detail_value(kitchen_type)
             or kitchen_type == OPEN_KITCHEN
         )
-        and SUBLET_MARKER not in subletting
+        and sharing_type != "shared"
         and age_matches
         and area_matches
     )
@@ -762,7 +875,14 @@ def enrich(
             time.sleep(REQUEST_DELAY_SECONDS)
 
     enriched_rows = read_csv_rows(cache_path)
-    matches = [listing for listing in enriched_rows if matches_filters(listing)]
+    matches: list[dict[str, Any]] = []
+    for listing in enriched_rows:
+        if not matches_filters(listing):
+            continue
+        sharing_type, sharing_terms = classify_sharing(listing)
+        listing["sharing_type"] = sharing_type
+        listing["sharing_terms"] = " | ".join(sharing_terms)
+        matches.append(listing)
     matches.sort(
         key=lambda item: (
             int(item["price_hkd"]),
@@ -777,7 +897,7 @@ def enrich(
 def write_csv(path: Path, listings: list[dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8", newline="") as output:
-        writer = csv.DictWriter(output, fieldnames=CSV_FIELDS)
+        writer = csv.DictWriter(output, fieldnames=OUTPUT_FIELDS)
         writer.writeheader()
         writer.writerows(listings)
 
