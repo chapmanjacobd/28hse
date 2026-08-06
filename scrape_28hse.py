@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Download filtered Hong Kong apartment rental listings from 28Hse."""
+"""Download filtered Hong Kong apartment listings from 28Hse, rent or buy.
+
+Run with --mode rent (default) for monthly rentals or --mode buy for sales.
+Buy mode additionally estimates each listing's monthly cost of ownership
+(mortgage plus "HOA-like" holding costs) and skips listings whose estimated
+monthly outlay exceeds a budget, mirroring the model in hk_costs.py.
+"""
 
 from __future__ import annotations
 
@@ -12,6 +18,7 @@ import re
 import sys
 import time
 import types
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Self
@@ -21,16 +28,15 @@ from urllib.request import Request, urlopen
 
 from bs4 import BeautifulSoup
 
+import hk_costs
+
 LOG = logging.getLogger(__name__)
 
 
-BASE_URL = "https://www.28hse.com/rent/apartment"
 USER_AGENT = "hk-apartment-research/1.0 (+https://www.28hse.com/robots.txt)"
 REQUEST_DELAY_SECONDS = 0.25
 PAGE_SIZE = 15
-DISTRICT_URLS = tuple(
-    f"{BASE_URL}{path}"
-    for path in (
+DISTRICT_PATHS = (
         # Hong Kong Island
         "/a1/dg2",  # Central, Sheung Wan
         "/a1/dg1",  # Sai Ying Pun, Shek Tong Tsui
@@ -63,10 +69,7 @@ DISTRICT_URLS = tuple(
         "/a3/dg49",  # Tsuen Wan, Tai Wo Hau
         "/a3/dg40",  # Sai Kung, Clear Water Bay
     )
-)
 
-MIN_RENT_HKD = 7_000
-MAX_RENT_HKD = 17_000
 MIN_AREA_SQFT = 350
 MAX_AREA_SQFT = 900
 MIN_BEDROOMS = 1
@@ -257,12 +260,50 @@ ROOM_LAYOUT_PATTERN = re.compile(
 # 28Hse exposes preset buckets. Detail-page filters are enforced locally so
 # listings with incomplete server-side metadata are not excluded prematurely.
 SEARCH_PARAMS = {
-    "price": "2,3,4",  # HK$5,000-20,000
     "areaOption": "sales",  # usable/saleable area
     "areaRange": "2,3",  # 300-1,000 sqft
     "roomRange": "1,2,3",
     "sortBy": "latest",
 }
+
+
+@dataclass(frozen=True)
+class Profile:
+    """Mode-specific crawling and filtering settings for rent or buy."""
+
+    key: str
+    base_url: str
+    search_price: str  # 28Hse price buckets to request
+    min_price: int
+    max_price: int
+    default_candidates: Path
+    default_cache: Path
+    default_output: Path
+
+
+RENT_PROFILE = Profile(
+    key="rent",
+    base_url="https://www.28hse.com/rent/apartment",
+    search_price="2,3,4",  # HK$5,000-20,000/mo buckets
+    min_price=7_000,
+    max_price=17_000,
+    default_candidates=Path("data/28hse_candidates.csv"),
+    default_cache=Path("data/28hse_enriched.csv"),
+    default_output=Path("data/28hse_rentals.csv"),
+)
+
+BUY_PROFILE = Profile(
+    key="buy",
+    base_url="https://www.28hse.com/buy/apartment",
+    search_price="2,3,4",  # HK$2M-20M sale-price buckets
+    min_price=2_000_000,
+    max_price=12_000_000,
+    default_candidates=Path("data/28hse_buy_candidates.csv"),
+    default_cache=Path("data/28hse_buy_enriched.csv"),
+    default_output=Path("data/28hse_buy.csv"),
+)
+
+PROFILES = {profile.key: profile for profile in (RENT_PROFILE, BUY_PROFILE)}
 
 CSV_FIELDS = [
     "listing_id",
@@ -316,8 +357,13 @@ CARD_FIELDS = [
     "url",
     "fetched_at",
 ]
-DEFAULT_CANDIDATES_PATH = Path("data/28hse_candidates.csv")
-DEFAULT_ENRICHED_CACHE_PATH = Path("data/28hse_enriched.csv")
+
+
+def output_fields(profile: Profile) -> list[str]:
+    fields = [*OUTPUT_FIELDS]
+    if profile is BUY_PROFILE:
+        fields += hk_costs.COST_FIELDS
+    return fields
 
 
 def strip_contact_info(value: Any, field: str | None = None) -> Any:
@@ -342,9 +388,10 @@ def sanitize_row(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def build_url(page: int, base_url: str = BASE_URL) -> str:
+def build_url(page: int, base_url: str, profile: Profile) -> str:
     path = base_url if page == 1 else f"{base_url}/page-{page}"
-    return f"{path}?{urlencode(SEARCH_PARAMS)}"
+    params = {**SEARCH_PARAMS, "price": profile.search_price}
+    return f"{path}?{urlencode(params)}"
 
 
 def fetch_html(url: str) -> str:
@@ -378,6 +425,30 @@ def first_number(text: str) -> int | None:
 def first_match(text: str, pattern: str) -> int | None:
     match = re.search(pattern, text)
     return int(match.group(1).replace(",", "")) if match else None
+
+
+BUY_PRICE_PATTERN = re.compile(r"\$([\d][\d,]*(?:\.\d+)?)\s*(萬|億)?")
+
+
+def parse_card_price(text: str, profile: Profile) -> int | None:
+    """Parse the price label on a listing card.
+
+    Rent labels look like "租 $16,000 元" (HKD/month). Buy labels look like
+    "售 $798 萬元" or "售 $1.3 億元", where the amount is in 萬 (10,000) or
+    億 (100,000,000).
+    """
+    if profile is RENT_PROFILE:
+        return first_match(text, r"\$([\d,]+)")
+    match = BUY_PRICE_PATTERN.search(text)
+    if match is None:
+        return None
+    value = float(match.group(1).replace(",", ""))
+    unit = match.group(2)
+    if unit == "萬":
+        value *= 10_000
+    elif unit == "億":
+        value *= 100_000_000
+    return int(value)
 
 
 def parse_json_ld(soup: BeautifulSoup) -> dict[str, Any] | None:
@@ -436,7 +507,9 @@ def listing_id_from_card(card: BeautifulSoup) -> str | None:
     return id_match.group(1) if id_match else None
 
 
-def parse_listing(card: BeautifulSoup, fetched_at: str) -> dict[str, Any] | None:
+def parse_listing(
+    card: BeautifulSoup, fetched_at: str, profile: Profile
+) -> dict[str, Any] | None:
     link = card.select_one('a.detail_page[href*="/property-"]')
     listing_id = listing_id_from_card(card)
     if link is None or listing_id is None:
@@ -446,14 +519,14 @@ def parse_listing(card: BeautifulSoup, fetched_at: str) -> dict[str, Any] | None
     if not isinstance(url, str):
         return None
 
-    price_node = card.select_one("div.extra div.ui.right.floated.green.large.label")
+    price_node = card.select_one("div.extra div.ui.right.floated.large.label")
     area_node = card.select_one("div.areaUnitPrice")
     room_node = card.select_one("div.extra div.tagLabels div.ui.label")
     if price_node is None or area_node is None or room_node is None:
         LOG.debug("incomplete listing card skipped: %s", url)
         return None
 
-    price = first_match(price_node.get_text(" ", strip=True), r"\$([\d,]+)")
+    price = parse_card_price(price_node.get_text(" ", strip=True), profile)
     area = first_number(area_node.get_text(" ", strip=True))
     room_text = room_node.get_text(" ", strip=True)
     bedrooms = first_match(room_text, r"(\d+)\s*房")
@@ -678,17 +751,46 @@ def classify_sharing(listing: dict[str, Any]) -> tuple[str, list[str]]:
     return "whole", []
 
 
-def matches_card_filters(listing: dict[str, Any]) -> bool:
-    return (
-        MIN_RENT_HKD <= int(listing["price_hkd"]) <= MAX_RENT_HKD
+def estimated_monthly_outlay_hkd(
+    listing: dict[str, Any], cost_params: hk_costs.CostParams
+) -> int | None:
+    try:
+        price = int(listing["price_hkd"])
+        area = int(listing["usable_area_sqft"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    return round(hk_costs.estimated_monthly_outlay(price, area, cost_params))
+
+
+def matches_card_filters(
+    listing: dict[str, Any], profile: Profile, cost_params: hk_costs.CostParams | None = None
+) -> bool:
+    if not (
+        profile.min_price
+        <= int(listing["price_hkd"])
+        <= profile.max_price
         and MIN_AREA_SQFT <= int(listing["usable_area_sqft"]) <= MAX_AREA_SQFT
         and MIN_BEDROOMS <= int(listing["bedrooms"]) <= MAX_BEDROOMS
         and district_is_allowed(str(listing["district"]))
         and not property_type_is_excluded(str(listing["property_type"]))
-    )
+    ):
+        return False
+    if (
+        profile is BUY_PROFILE
+        and cost_params is not None
+        and cost_params.max_monthly_outlay is not None
+    ):
+        outlay = estimated_monthly_outlay_hkd(listing, cost_params)
+        if outlay is not None and outlay > cost_params.max_monthly_outlay:
+            return False
+    return True
 
 
-def filter_rejections(listing: dict[str, Any]) -> list[str]:
+def filter_rejections(
+    listing: dict[str, Any],
+    profile: Profile,
+    cost_params: hk_costs.CostParams | None = None,
+) -> list[str]:
     """Return human-readable reasons a listing fails the detail filters."""
     reasons: list[str] = []
 
@@ -697,9 +799,10 @@ def filter_rejections(listing: dict[str, Any]) -> list[str]:
     except (KeyError, TypeError, ValueError):
         reasons.append("price is unparseable")
     else:
-        if not MIN_RENT_HKD <= price <= MAX_RENT_HKD:
+        if not profile.min_price <= price <= profile.max_price:
             reasons.append(
-                f"price HK${price:,} outside HK${MIN_RENT_HKD:,}-{MAX_RENT_HKD:,}"
+                f"price HK${price:,} outside "
+                f"HK${profile.min_price:,}-{profile.max_price:,}"
             )
 
     try:
@@ -734,11 +837,24 @@ def filter_rejections(listing: dict[str, Any]) -> list[str]:
     if not is_unknown_detail_value(kitchen_type) and kitchen_type != OPEN_KITCHEN:
         reasons.append(f"kitchen type {kitchen_type!r} is not an open kitchen")
 
-    sharing_type, sharing_terms = classify_sharing(listing)
-    if sharing_type == "shared":
-        reasons.append(
-            f"shared rental (matched: {', '.join(sharing_terms) or 'unknown'})"
-        )
+    if profile is RENT_PROFILE:
+        sharing_type, sharing_terms = classify_sharing(listing)
+        if sharing_type == "shared":
+            reasons.append(
+                f"shared rental (matched: {', '.join(sharing_terms) or 'unknown'})"
+            )
+
+    if (
+        profile is BUY_PROFILE
+        and cost_params is not None
+        and cost_params.max_monthly_outlay is not None
+    ):
+        outlay = estimated_monthly_outlay_hkd(listing, cost_params)
+        if outlay is not None and outlay > cost_params.max_monthly_outlay:
+            reasons.append(
+                f"estimated monthly outlay HK${outlay:,} exceeds budget "
+                f"HK${cost_params.max_monthly_outlay:,.0f}"
+            )
 
     building_age = listing.get("building_age_years")
     if not is_unknown_detail_value(building_age):
@@ -768,8 +884,12 @@ def filter_rejections(listing: dict[str, Any]) -> list[str]:
     return reasons
 
 
-def matches_filters(listing: dict[str, Any]) -> bool:
-    return not filter_rejections(listing)
+def matches_filters(
+    listing: dict[str, Any],
+    profile: Profile,
+    cost_params: hk_costs.CostParams | None = None,
+) -> bool:
+    return not filter_rejections(listing, profile, cost_params)
 
 
 class IncrementalCsvWriter:
@@ -895,6 +1015,8 @@ def read_csv_rows(path: Path) -> list[dict[str, str]]:
 def scrape(
     max_pages: int | None,
     candidates_path: Path,
+    profile: Profile,
+    cost_params: hk_costs.CostParams | None = None,
     page_limit: int | None = None,
 ) -> int:
     fetched_at = datetime.now(timezone.utc).isoformat()
@@ -905,7 +1027,8 @@ def scrape(
     with SeenSet(seen_path) as seen, IncrementalCsvWriter(
         candidates_path, CARD_FIELDS
     ) as output:
-        for district_url in DISTRICT_URLS:
+        for district_path in DISTRICT_PATHS:
+            district_url = f"{profile.base_url}{district_path}"
             if page_limit is not None and pages_scraped >= page_limit:
                 break
             page = 1
@@ -914,7 +1037,7 @@ def scrape(
             while (max_pages is None or page <= max_pages) and (
                 page_limit is None or pages_scraped < page_limit
             ):
-                url = build_url(page, district_url)
+                url = build_url(page, district_url, profile)
                 LOG.debug("downloading page %s: %s", page, url)
                 soup = BeautifulSoup(fetch_html(url), "html.parser")
                 pages_scraped += 1
@@ -947,10 +1070,10 @@ def scrape(
                         page_unseen += 1
                         seen.add(listing_id)
 
-                    listing = parse_listing(card, fetched_at)
+                    listing = parse_listing(card, fetched_at, profile)
                     if (
                         listing is not None
-                        and matches_card_filters(listing)
+                        and matches_card_filters(listing, profile, cost_params)
                         and output.append(listing)
                     ):
                         new_candidates += 1
@@ -977,10 +1100,12 @@ def scrape(
     return new_candidates
 
 
-def write_csv(path: Path, listings: list[dict[str, Any]]) -> None:
+def write_csv(
+    path: Path, listings: list[dict[str, Any]], fieldnames: list[str]
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8", newline="") as output:
-        writer = csv.DictWriter(output, fieldnames=OUTPUT_FIELDS)
+        writer = csv.DictWriter(output, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(sanitize_row(listing) for listing in listings)
 
@@ -989,6 +1114,8 @@ def enrich(
     candidates_path: Path,
     output_path: Path,
     cache_path: Path,
+    profile: Profile,
+    cost_params: hk_costs.CostParams | None = None,
 ) -> int:
     if output_path.resolve() == cache_path.resolve():
         raise RuntimeError("--output and --cache must be different paths")
@@ -1045,7 +1172,7 @@ def enrich(
     enriched_rows = read_csv_rows(cache_path)
     matches: list[dict[str, Any]] = []
     for listing in enriched_rows:
-        rejections = filter_rejections(listing)
+        rejections = filter_rejections(listing, profile, cost_params)
         if rejections:
             listing_id = listing.get("listing_id", "")
             if listing_id in newly_enriched:
@@ -1053,9 +1180,15 @@ def enrich(
                     "%s filtered out: %s", listing.get("url", ""), "; ".join(rejections)
                 )
             continue
-        sharing_type, sharing_terms = classify_sharing(listing)
-        listing["sharing_type"] = sharing_type
-        listing["sharing_terms"] = " | ".join(sharing_terms)
+        if profile is RENT_PROFILE:
+            sharing_type, sharing_terms = classify_sharing(listing)
+            listing["sharing_type"] = sharing_type
+            listing["sharing_terms"] = " | ".join(sharing_terms)
+        else:
+            listing["sharing_type"] = ""
+            listing["sharing_terms"] = ""
+            if cost_params is not None:
+                listing.update(hk_costs.compute_buy_costs(listing, cost_params))
         matches.append(listing)
     matches.sort(
         key=lambda item: (
@@ -1064,7 +1197,7 @@ def enrich(
             item["listing_id"],
         )
     )
-    write_csv(output_path, matches)
+    write_csv(output_path, matches, output_fields(profile))
     return new_enriched
 
 
@@ -1078,22 +1211,31 @@ def main() -> None:
         help="run scraping, enrichment, or both (default: all)",
     )
     parser.add_argument(
+        "--mode",
+        choices=tuple(PROFILES),
+        default="rent",
+        help="crawl rental or sales listings (default: rent)",
+    )
+    parser.add_argument(
         "--output",
         type=Path,
-        default=Path("data/28hse_rentals.csv"),
-        help="CSV output path (default: data/28hse_rentals.csv)",
+        default=None,
+        help="CSV output path (default: data/28hse_rentals.csv for rent, "
+        "data/28hse_buy.csv for buy)",
     )
     parser.add_argument(
         "--candidates",
         type=Path,
-        default=DEFAULT_CANDIDATES_PATH,
-        help="incremental candidate CSV (default: data/28hse_candidates.csv)",
+        default=None,
+        help="incremental candidate CSV (default: data/28hse_candidates.csv "
+        "for rent, data/28hse_buy_candidates.csv for buy)",
     )
     parser.add_argument(
         "--cache",
         type=Path,
-        default=DEFAULT_ENRICHED_CACHE_PATH,
-        help="incremental detail cache (default: data/28hse_enriched.csv)",
+        default=None,
+        help="incremental detail cache (default: data/28hse_enriched.csv "
+        "for rent, data/28hse_buy_enriched.csv for buy)",
     )
     parser.add_argument(
         "--max-pages",
@@ -1104,6 +1246,79 @@ def main() -> None:
         "--limit",
         type=int,
         help="limit total listing pages across all districts",
+    )
+    cost_group = parser.add_argument_group("cost model (buy mode only)")
+    cost_group.add_argument(
+        "--cost-capital",
+        type=float,
+        default=1_000_000,
+        metavar="HKD",
+        help="liquid capital available for the buy/rent comparison "
+        "(default: 1000000)",
+    )
+    cost_group.add_argument(
+        "--cost-mortgage-rate",
+        type=float,
+        default=0.0375,
+        help="annual mortgage rate (default: 0.0375)",
+    )
+    cost_group.add_argument(
+        "--cost-mortgage-term",
+        type=int,
+        default=25,
+        help="mortgage term in years (default: 25)",
+    )
+    cost_group.add_argument(
+        "--cost-down-payment",
+        type=float,
+        default=0.30,
+        help="down payment as a fraction of price (default: 0.30)",
+    )
+    cost_group.add_argument(
+        "--cost-rental-yield",
+        type=float,
+        default=0.025,
+        help="assumed rental yield of the flat (default: 0.025)",
+    )
+    cost_group.add_argument(
+        "--cost-appreciation",
+        type=float,
+        default=0.03,
+        help="annual home appreciation (default: 0.03)",
+    )
+    cost_group.add_argument(
+        "--cost-inflation",
+        type=float,
+        default=0.03,
+        help="annual inflation (default: 0.03)",
+    )
+    cost_group.add_argument(
+        "--cost-stock-return",
+        type=float,
+        default=0.07,
+        help="annual investment return (default: 0.07)",
+    )
+    cost_group.add_argument(
+        "--cost-purchase-fees",
+        type=float,
+        default=0.045,
+        help="stamp duty + agency + legal, as a fraction of price "
+        "(default: 0.045)",
+    )
+    cost_group.add_argument(
+        "--cost-management-sqft",
+        type=float,
+        default=4.5,
+        help="estimated monthly building management fee per usable sqft "
+        "(default: 4.5)",
+    )
+    cost_group.add_argument(
+        "--max-monthly-outlay",
+        type=float,
+        default=35_000,
+        metavar="HKD",
+        help="skip buy listings whose estimated monthly outlay (mortgage "
+        "plus holding costs) exceeds this (default: 35000)",
     )
     parser.add_argument(
         "-v",
@@ -1119,6 +1334,24 @@ def main() -> None:
     if args.limit is not None and args.limit < 1:
         parser.error("--limit must be at least 1")
 
+    profile = PROFILES[args.mode]
+    candidates = args.candidates or profile.default_candidates
+    cache = args.cache or profile.default_cache
+    output = args.output or profile.default_output
+    cost_params = hk_costs.CostParams(
+        total_capital=args.cost_capital,
+        mortgage_rate=args.cost_mortgage_rate,
+        mortgage_term=args.cost_mortgage_term,
+        down_payment_pct=args.cost_down_payment,
+        rental_yield=args.cost_rental_yield,
+        appreciation=args.cost_appreciation,
+        inflation=args.cost_inflation,
+        stock_return=args.cost_stock_return,
+        purchase_fees_pct=args.cost_purchase_fees,
+        management_per_sqft=args.cost_management_sqft,
+        max_monthly_outlay=args.max_monthly_outlay,
+    )
+
     logging.basicConfig(
         level={
             0: logging.WARNING,
@@ -1128,14 +1361,16 @@ def main() -> None:
     )
 
     if args.stage in ("all", "scrape"):
-        new_candidates = scrape(args.max_pages, args.candidates, args.limit)
-        print(f"saved {new_candidates} new card-filtered listings to {args.candidates}")
+        new_candidates = scrape(
+            args.max_pages, candidates, profile, cost_params, args.limit
+        )
+        print(f"saved {new_candidates} new card-filtered listings to {candidates}")
 
     if args.stage in ("all", "enrich"):
-        new_enriched = enrich(args.candidates, args.output, args.cache)
+        new_enriched = enrich(candidates, output, cache, profile, cost_params)
         print(
             f"enriched {new_enriched} new listings; "
-            f"wrote matching listings to {args.output}"
+            f"wrote matching listings to {output}"
         )
 
 

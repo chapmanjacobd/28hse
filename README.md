@@ -1,7 +1,8 @@
-# Hong Kong apartment rental downloader
+# Hong Kong apartment downloader (rent or buy)
 
-This downloader retrieves 28Hse apartment rental listings using the site's
-public listing pages and applies these filters:
+This downloader retrieves 28Hse apartment listings using the site's public
+listing pages and applies these filters to rentals (`--mode rent`, the
+default):
 
 - HK Island: Central, Sheung Wan, Sai Ying Pun, Shek Tong Tsui, Tin Hau, or
   Tai Hang
@@ -87,6 +88,46 @@ so an interrupted run can be resumed safely. Use `--limit 1` with the
 `scrape` stage to fetch exactly one page total, or `--max-pages 1` to fetch
 one page per district. Use `--candidates`, `--cache`, and `--output` to choose
 different paths.
+
+## Buy mode
+
+`--mode buy` crawls sales listings instead of rentals. It reuses the same
+district, area, bedroom, floor, kitchen, building-age, and property-type
+filters, but targets a sale price of HK$2,000,000 through HK$12,000,000 and
+parses the `售 $798 萬元` / `售 $1.3 億元` card prices into HKD. Its default
+files are `data/28hse_buy_candidates.csv`, `data/28hse_buy_enriched.csv`, and
+`data/28hse_buy.csv`. The rent-specific fields (`rent_includes`,
+`subletting`, and the shared-rental classification) are left empty in buy
+mode.
+
+Because management fees ("HOA-like" holding costs) are not exposed on 28Hse,
+the cost model in `hk_costs.py` estimates them. Buy mode computes each
+listing's estimated monthly outlay (mortgage plus rates, management fee, and
+maintenance) and skips listings whose outlay exceeds
+`--max-monthly-outlay` (default HK$35,000) before they are enriched, so
+unaffordable flats never cost a detail-page fetch. `hk_costs.py` also drives
+the extra output columns, a 30-year buy-vs-rent comparison in the spirit of
+`~/bin/condo.py`:
+
+- `monthly_mortgage_hkd`, `monthly_holding_hkd`, `monthly_outlay_hkd`,
+  `initial_outlay_hkd`, `est_market_rent_hkd`
+- `npv_total_cost_buy_30y_hkd`, `npv_total_cost_rent_30y_hkd`
+- `npv_net_worth_buy_30y_hkd`, `npv_net_worth_rent_30y_hkd`,
+  `buy_vs_rent_30y_hkd`
+
+Both scenarios start from the same liquid capital and the same monthly
+housing budget, the flat's estimated market rent (price times the assumed
+rental yield). The renter spends the whole budget on rent; the buyer pays the
+mortgage (default 25 years at 3.75%, 30% down payment) plus holding costs and
+invests or draws the difference, while the home appreciates. Cash values are
+deflated by inflation to today's dollars. Assumptions can be overridden, e.g.:
+
+```sh
+python3 scrape_28hse.py --mode buy --cost-down-payment 0.20 \
+    --cost-mortgage-rate 0.04 --max-monthly-outlay 40000
+```
+
+Run `python3 scrape_28hse.py --help` for the full list of `--cost-*` flags.
 
 Progress and diagnostic messages go through the `logging` module to stderr.
 By default only warnings are shown; `-v` additionally shows info messages
