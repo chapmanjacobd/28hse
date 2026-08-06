@@ -61,6 +61,13 @@ COST_FIELDS = [
 ]
 
 
+def _fmt_money(value: float) -> str:
+    """Format an HKD amount, abbreviating values above 100k to millions."""
+    if abs(value) > 100_000:
+        return f"${value / 1_000_000:.2f}M"
+    return f"${value:,.0f}"
+
+
 def monthly_payment(loan: float, annual_rate: float, months: int) -> float:
     """Amortized monthly payment for a fixed-rate loan."""
     if months <= 0 or loan <= 0:
@@ -310,13 +317,13 @@ def build_district_table(
             [
                 district + (" *" if estimated else ""),
                 f"{units}",
-                f"${median_price:,.0f}",
-                f"${costs['monthly_outlay_hkd']:,.0f}",
-                f"${market_rent:,.0f}",
-                f"${costs['npv_total_cost_buy_30y_hkd']:,.0f}",
-                f"${costs['npv_total_cost_rent_30y_hkd']:,.0f}",
-                f"${costs['npv_net_worth_buy_30y_hkd']:,.0f}",
-                f"${costs['buy_vs_rent_30y_hkd']:,.0f}",
+                _fmt_money(median_price),
+                _fmt_money(costs['monthly_outlay_hkd']),
+                _fmt_money(market_rent),
+                _fmt_money(costs['npv_total_cost_buy_30y_hkd']),
+                _fmt_money(costs['npv_total_cost_rent_30y_hkd']),
+                _fmt_money(costs['npv_net_worth_buy_30y_hkd']),
+                _fmt_money(costs['buy_vs_rent_30y_hkd']),
                 _vs_rent_pct(costs),
             ]
         )
@@ -387,14 +394,14 @@ def build_listing_table(
         table.append(
             [
                 label + (" *" if estimated else ""),
-                f"${price:,.0f}",
+                _fmt_money(price),
                 f"{area:,.0f}",
-                f"${costs['monthly_outlay_hkd']:,.0f}",
-                f"${market_rent:,.0f}",
-                f"${costs['npv_total_cost_buy_30y_hkd']:,.0f}",
-                f"${costs['npv_total_cost_rent_30y_hkd']:,.0f}",
-                f"${costs['npv_net_worth_buy_30y_hkd']:,.0f}",
-                f"${costs['buy_vs_rent_30y_hkd']:,.0f}",
+                _fmt_money(costs['monthly_outlay_hkd']),
+                _fmt_money(market_rent),
+                _fmt_money(costs['npv_total_cost_buy_30y_hkd']),
+                _fmt_money(costs['npv_total_cost_rent_30y_hkd']),
+                _fmt_money(costs['npv_net_worth_buy_30y_hkd']),
+                _fmt_money(costs['buy_vs_rent_30y_hkd']),
                 _vs_rent_pct(costs),
             ]
         )
