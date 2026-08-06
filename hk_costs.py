@@ -357,9 +357,6 @@ def build_listing_table(
         "Area",
         "Monthly Outlay",
         "Market Rent",
-        "NPV Buy Costs",
-        "NPV Rent Costs",
-        "NPV Buy Worth",
         "Buy vs Rent",
         "vs Rent",
     ]
@@ -378,29 +375,21 @@ def build_listing_table(
             rent_psf_by_district,
             all_rent_psf,
         )
-        bedrooms = str(row.get("bedrooms") or "").strip()
-        bedrooms = f" {bedrooms}房" if bedrooms else ""
-        label = (
-            f"{district} {_short_property_type(row.get('property_type', ''))}"
-            f"{bedrooms}"
-        )
+        url = row.get("url", "")
         costs = buy_vs_rent(price, area, params, rent=market_rent)
-        raw.append((label, price, area, market_rent, costs, estimated))
+        raw.append((url, price, area, market_rent, costs, estimated))
 
     raw.sort(key=lambda item: item[4]["buy_vs_rent_30y_hkd"], reverse=True)
 
     table: list[list[str]] = []
-    for label, price, area, market_rent, costs, estimated in raw:
+    for url, price, area, market_rent, costs, estimated in raw:
         table.append(
             [
-                label + (" *" if estimated else ""),
+                url,
                 _fmt_money(price),
                 f"{area:,.0f}",
                 _fmt_money(costs['monthly_outlay_hkd']),
                 _fmt_money(market_rent),
-                _fmt_money(costs['npv_total_cost_buy_30y_hkd']),
-                _fmt_money(costs['npv_total_cost_rent_30y_hkd']),
-                _fmt_money(costs['npv_net_worth_buy_30y_hkd']),
                 _fmt_money(costs['buy_vs_rent_30y_hkd']),
                 _vs_rent_pct(costs),
             ]
