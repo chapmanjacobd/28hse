@@ -37,38 +37,38 @@ USER_AGENT = "hk-apartment-research/1.0 (+https://www.28hse.com/robots.txt)"
 REQUEST_DELAY_SECONDS = 0.25
 PAGE_SIZE = 15
 DISTRICT_PATHS = (
-        # Hong Kong Island
-        "/a1/dg2",  # Central, Sheung Wan
-        "/a1/dg1",  # Sai Ying Pun, Shek Tong Tsui
-        "/a1/dg6",  # Tin Hau, Tai Hang
-        # Kowloon
-        "/a2/dg115",  # Whampoa
-        "/a2/dg31",  # Hung Hom
-        "/a2/dg30",  # Tsim Sha Tsui
-        "/a2/dg120",  # Jordan
-        "/a2/dg111",  # Yau Ma Tei
-        "/a2/dg110",  # Mong Kok
-        "/a2/dg29",  # Prince Edward
-        "/a2/dg28",  # Tai Kok Tsui, Olympic, Kowloon Station
-        "/a2/dg109",  # Lai King
-        "/a2/dg107",  # Mei Foo
-        "/a2/dg106",  # Cheung Sha Wan
-        "/a2/dg27",  # Lai Chi Kok
-        "/a2/dg26",  # Sham Shui Po, Shek Kip Mei, Nam Cheong
-        "/a2/dg119",  # Yau Yat Tsuen
-        "/a2/dg118",  # Ho Man Tin
-        "/a2/dg25",  # Kowloon Tong
-        "/a2/dg32",  # San Po Kong, Wong Tai Sin
-        "/a2/dg108",  # Kai Tak
-        "/a2/dg116",  # Kowloon City
-        "/a2/dg24",  # To Kwa Wan
-        "/a2/dg23",  # Diamond Hill, Lok Fu
-        # New Territories
-        "/a3/dg51",  # Tsing Yi
-        "/a3/dg50",  # Kwai Chung, Kwai Fong
-        "/a3/dg49",  # Tsuen Wan, Tai Wo Hau
-        "/a3/dg40",  # Sai Kung, Clear Water Bay
-    )
+    # Hong Kong Island
+    "/a1/dg2",  # Central, Sheung Wan
+    "/a1/dg1",  # Sai Ying Pun, Shek Tong Tsui
+    "/a1/dg6",  # Tin Hau, Tai Hang
+    # Kowloon
+    "/a2/dg115",  # Whampoa
+    "/a2/dg31",  # Hung Hom
+    "/a2/dg30",  # Tsim Sha Tsui
+    "/a2/dg120",  # Jordan
+    "/a2/dg111",  # Yau Ma Tei
+    "/a2/dg110",  # Mong Kok
+    "/a2/dg29",  # Prince Edward
+    "/a2/dg28",  # Tai Kok Tsui, Olympic, Kowloon Station
+    "/a2/dg109",  # Lai King
+    "/a2/dg107",  # Mei Foo
+    "/a2/dg106",  # Cheung Sha Wan
+    "/a2/dg27",  # Lai Chi Kok
+    "/a2/dg26",  # Sham Shui Po, Shek Kip Mei, Nam Cheong
+    "/a2/dg119",  # Yau Yat Tsuen
+    "/a2/dg118",  # Ho Man Tin
+    "/a2/dg25",  # Kowloon Tong
+    "/a2/dg32",  # San Po Kong, Wong Tai Sin
+    "/a2/dg108",  # Kai Tak
+    "/a2/dg116",  # Kowloon City
+    "/a2/dg24",  # To Kwa Wan
+    "/a2/dg23",  # Diamond Hill, Lok Fu
+    # New Territories
+    "/a3/dg51",  # Tsing Yi
+    "/a3/dg50",  # Kwai Chung, Kwai Fong
+    "/a3/dg49",  # Tsuen Wan, Tai Wo Hau
+    "/a3/dg40",  # Sai Kung, Clear Water Bay
+)
 
 MIN_AREA_SQFT = 350
 MAX_AREA_SQFT = 900
@@ -382,10 +382,7 @@ def strip_contact_info(value: Any, field: str | None = None) -> Any:
 
 
 def sanitize_row(row: dict[str, Any]) -> dict[str, Any]:
-    return {
-        field: strip_contact_info(value, field)
-        for field, value in row.items()
-    }
+    return {field: strip_contact_info(value, field) for field, value in row.items()}
 
 
 def build_url(page: int, base_url: str, profile: Profile) -> str:
@@ -543,22 +540,24 @@ def parse_listing(
         district_links[1].get_text(" ", strip=True) if len(district_links) > 1 else ""
     )
 
-    return sanitize_row({
-        "listing_id": listing_id,
-        "title": title_link.get_text(" ", strip=True),
-        "district": (
-            district_links[0].get_text(" ", strip=True) if district_links else ""
-        ),
-        "property_type": property_type,
-        "price_hkd": price,
-        "usable_area_sqft": area,
-        "bedrooms": bedrooms,
-        "bathrooms": bathrooms or "",
-        "agency": agency_node.get_text(" ", strip=True) if agency_node else "",
-        "image_url": image.get("src", "") if image else "",
-        "url": url,
-        "fetched_at": fetched_at,
-    })
+    return sanitize_row(
+        {
+            "listing_id": listing_id,
+            "title": title_link.get_text(" ", strip=True),
+            "district": (
+                district_links[0].get_text(" ", strip=True) if district_links else ""
+            ),
+            "property_type": property_type,
+            "price_hkd": price,
+            "usable_area_sqft": area,
+            "bedrooms": bedrooms,
+            "bathrooms": bathrooms or "",
+            "agency": agency_node.get_text(" ", strip=True) if agency_node else "",
+            "image_url": image.get("src", "") if image else "",
+            "url": url,
+            "fetched_at": fetched_at,
+        }
+    )
 
 
 def parse_property_types(soup: BeautifulSoup) -> str:
@@ -763,12 +762,12 @@ def estimated_monthly_outlay_hkd(
 
 
 def matches_card_filters(
-    listing: dict[str, Any], profile: Profile, cost_params: hk_costs.CostParams | None = None
+    listing: dict[str, Any],
+    profile: Profile,
+    cost_params: hk_costs.CostParams | None = None,
 ) -> bool:
     if not (
-        profile.min_price
-        <= int(listing["price_hkd"])
-        <= profile.max_price
+        profile.min_price <= int(listing["price_hkd"]) <= profile.max_price
         and MIN_AREA_SQFT <= int(listing["usable_area_sqft"]) <= MAX_AREA_SQFT
         and MIN_BEDROOMS <= int(listing["bedrooms"]) <= MAX_BEDROOMS
         and district_is_allowed(str(listing["district"]))
@@ -1302,8 +1301,7 @@ def main() -> None:
         "--cost-purchase-fees",
         type=float,
         default=0.045,
-        help="stamp duty + agency + legal, as a fraction of price "
-        "(default: 0.045)",
+        help="stamp duty + agency + legal, as a fraction of price " "(default: 0.045)",
     )
     cost_group.add_argument(
         "--cost-management-sqft",

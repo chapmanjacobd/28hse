@@ -93,7 +93,9 @@ def estimated_rent_monthly(price: float, params: CostParams) -> float:
 
 
 def estimated_monthly_outlay(price: float, area: float, params: CostParams) -> float:
-    return monthly_mortgage(price, params) + estimated_holding_monthly(price, area, params)
+    return monthly_mortgage(price, params) + estimated_holding_monthly(
+        price, area, params
+    )
 
 
 def buy_vs_rent(
@@ -194,6 +196,61 @@ def _read_csv_rows(path: Path) -> list[dict[str, Any]]:
         return list(csv.DictReader(source))
 
 
+def _rent_psf_index(
+    rental_rows: list[dict[str, Any]],
+) -> tuple[dict[str, list[float]], list[float]]:
+    """Index observed rent per usable sqft from the rentals CSV.
+
+    Returns (per-district median values, all values) for the rent lookup.
+    """
+    rent_psf_by_district: dict[str, list[float]] = {}
+    all_rent_psf: list[float] = []
+    for row in rental_rows:
+        rent = _parse_float(row.get("price_hkd"))
+        area = _parse_float(row.get("usable_area_sqft"))
+        if rent > 0 and area > 0:
+            rent_psf = rent / area
+            rent_psf_by_district.setdefault(row.get("district", ""), []).append(
+                rent_psf
+            )
+            all_rent_psf.append(rent_psf)
+    return rent_psf_by_district, all_rent_psf
+
+
+def _market_rent(
+    district: str,
+    area: float,
+    price: float,
+    params: CostParams,
+    rent_psf_by_district: dict[str, list[float]],
+    all_rent_psf: list[float],
+) -> tuple[float, bool]:
+    """Monthly rent for a flat, from observed rents when available.
+
+    Uses the district's median rent per sqft scaled to the flat's usable
+    area; falls back to the overall rental median, then to the assumed
+    rental yield. Returns (rent, estimated).
+    """
+    psf_values = rent_psf_by_district.get(district)
+    if psf_values:
+        return statistics.median(psf_values) * area, False
+    if all_rent_psf:
+        return statistics.median(all_rent_psf) * area, True
+    return estimated_rent_monthly(price, params), True
+
+
+def _vs_rent_pct(costs: dict[str, float]) -> str:
+    rent_worth = costs["npv_net_worth_rent_30y_hkd"]
+    if rent_worth > 0:
+        diff = costs["npv_net_worth_buy_30y_hkd"] - rent_worth
+        return f"{diff / rent_worth * 100:+.1f}%"
+    return "n/a"
+
+
+def _short_property_type(property_type: Any) -> str:
+    return str(property_type).split("/")[0]
+
+
 def build_district_table(
     rental_rows: list[dict[str, Any]],
     buy_rows: list[dict[str, Any]],
@@ -207,15 +264,7 @@ def build_district_table(
     rentals CSV, scaled to the median buy flat's usable area; districts
     without rental data fall back to the overall median rent per sqft.
     """
-    rent_psf_by_district: dict[str, list[float]] = {}
-    all_rent_psf: list[float] = []
-    for row in rental_rows:
-        rent = _parse_float(row.get("price_hkd"))
-        area = _parse_float(row.get("usable_area_sqft"))
-        if rent > 0 and area > 0:
-            rent_psf = rent / area
-            rent_psf_by_district.setdefault(row.get("district", ""), []).append(rent_psf)
-            all_rent_psf.append(rent_psf)
+    rent_psf_by_district, all_rent_psf = _rent_psf_index(rental_rows)
 
     buy_listings: dict[str, list[tuple[float, float]]] = {}
     for row in buy_rows:
@@ -240,29 +289,23 @@ def build_district_table(
     for district, listings in buy_listings.items():
         median_price = statistics.median([price for price, _ in listings])
         median_area = statistics.median([area for _, area in listings])
-        psf_values = rent_psf_by_district.get(district)
-        if psf_values:
-            market_rent = statistics.median(psf_values) * median_area
-            estimated = False
-        elif all_rent_psf:
-            market_rent = statistics.median(all_rent_psf) * median_area
-            estimated = True
-        else:
-            market_rent = estimated_rent_monthly(median_price, params)
-            estimated = True
+        market_rent, estimated = _market_rent(
+            district,
+            median_area,
+            median_price,
+            params,
+            rent_psf_by_district,
+            all_rent_psf,
+        )
         costs = buy_vs_rent(median_price, median_area, params, rent=market_rent)
-        raw.append((district, len(listings), median_price, costs, market_rent, estimated))
+        raw.append(
+            (district, len(listings), median_price, costs, market_rent, estimated)
+        )
 
     raw.sort(key=lambda item: item[3]["buy_vs_rent_30y_hkd"], reverse=True)
 
     table: list[list[str]] = []
     for district, units, median_price, costs, market_rent, estimated in raw:
-        buy_worth = costs["npv_net_worth_buy_30y_hkd"]
-        rent_worth = costs["npv_net_worth_rent_30y_hkd"]
-        if rent_worth > 0:
-            vs_rent = f"{(buy_worth - rent_worth) / rent_worth * 100:+.1f}%"
-        else:
-            vs_rent = "n/a"
         table.append(
             [
                 district + (" *" if estimated else ""),
@@ -272,9 +315,87 @@ def build_district_table(
                 f"${market_rent:,.0f}",
                 f"${costs['npv_total_cost_buy_30y_hkd']:,.0f}",
                 f"${costs['npv_total_cost_rent_30y_hkd']:,.0f}",
-                f"${buy_worth:,.0f}",
+                f"${costs['npv_net_worth_buy_30y_hkd']:,.0f}",
                 f"${costs['buy_vs_rent_30y_hkd']:,.0f}",
-                vs_rent,
+                _vs_rent_pct(costs),
+            ]
+        )
+
+    notes: list[str] = []
+    if any(estimated for _, _, _, _, _, estimated in raw):
+        notes.append(
+            "* rent estimated from the overall rental median; no rental "
+            "listings in this district"
+        )
+    return headers, table, notes
+
+
+def build_listing_table(
+    rental_rows: list[dict[str, Any]],
+    buy_rows: list[dict[str, Any]],
+    params: CostParams,
+) -> tuple[list[str], list[list[str]], list[str]]:
+    """Compare every buy listing against its market rent, one row each.
+
+    Returns (headers, table, notes) ready for tabulate, sorted by the
+    buy-vs-rent net-worth delta. Each row combines the listing's buy and
+    rent scenarios: the rent uses the district's observed median rent per
+    sqft from the rentals CSV, scaled to the listing's usable area.
+    """
+    rent_psf_by_district, all_rent_psf = _rent_psf_index(rental_rows)
+
+    headers = [
+        "Listing",
+        "Price",
+        "Area",
+        "Monthly Outlay",
+        "Market Rent",
+        "NPV Buy Costs",
+        "NPV Rent Costs",
+        "NPV Buy Worth",
+        "Buy vs Rent",
+        "vs Rent",
+    ]
+    raw: list[tuple[str, float, float, float, dict[str, float], bool]] = []
+    for row in buy_rows:
+        price = _parse_float(row.get("price_hkd"))
+        area = _parse_float(row.get("usable_area_sqft"))
+        if price <= 0 or area <= 0:
+            continue
+        district = row.get("district", "")
+        market_rent, estimated = _market_rent(
+            district,
+            area,
+            price,
+            params,
+            rent_psf_by_district,
+            all_rent_psf,
+        )
+        bedrooms = str(row.get("bedrooms") or "").strip()
+        bedrooms = f" {bedrooms}房" if bedrooms else ""
+        label = (
+            f"{district} {_short_property_type(row.get('property_type', ''))}"
+            f"{bedrooms}"
+        )
+        costs = buy_vs_rent(price, area, params, rent=market_rent)
+        raw.append((label, price, area, market_rent, costs, estimated))
+
+    raw.sort(key=lambda item: item[4]["buy_vs_rent_30y_hkd"], reverse=True)
+
+    table: list[list[str]] = []
+    for label, price, area, market_rent, costs, estimated in raw:
+        table.append(
+            [
+                label + (" *" if estimated else ""),
+                f"${price:,.0f}",
+                f"{area:,.0f}",
+                f"${costs['monthly_outlay_hkd']:,.0f}",
+                f"${market_rent:,.0f}",
+                f"${costs['npv_total_cost_buy_30y_hkd']:,.0f}",
+                f"${costs['npv_total_cost_rent_30y_hkd']:,.0f}",
+                f"${costs['npv_net_worth_buy_30y_hkd']:,.0f}",
+                f"${costs['buy_vs_rent_30y_hkd']:,.0f}",
+                _vs_rent_pct(costs),
             ]
         )
 
@@ -292,8 +413,8 @@ def main() -> None:
 
     parser = argparse.ArgumentParser(
         description=(
-            "Per-district buy-vs-rent table from the scraper's CSV outputs, "
-            "in the spirit of ~/bin/condo.py."
+            "Buy-vs-rent table from the scraper's CSV outputs, in the "
+            "spirit of ~/bin/condo.py."
         )
     )
     parser.add_argument(
@@ -307,6 +428,11 @@ def main() -> None:
         type=Path,
         default=Path("data/28hse_buy.csv"),
         help="sales listings CSV with cost columns (default: data/28hse_buy.csv)",
+    )
+    parser.add_argument(
+        "--listings",
+        action="store_true",
+        help="show one row per buy listing instead of one row per district",
     )
     cost_group = parser.add_argument_group("cost model")
     cost_group.add_argument(
@@ -363,8 +489,7 @@ def main() -> None:
         "--cost-purchase-fees",
         type=float,
         default=0.045,
-        help="stamp duty + agency + legal, as a fraction of price "
-        "(default: 0.045)",
+        help="stamp duty + agency + legal, as a fraction of price " "(default: 0.045)",
     )
     cost_group.add_argument(
         "--cost-management-sqft",
@@ -388,9 +513,9 @@ def main() -> None:
         management_per_sqft=args.cost_management_sqft,
     )
 
-    headers, table, notes = build_district_table(
-        _read_csv_rows(args.rentals), _read_csv_rows(args.buy), params
-    )
+    headers, table, notes = (
+        build_listing_table if args.listings else build_district_table
+    )(_read_csv_rows(args.rentals), _read_csv_rows(args.buy), params)
     print(tabulate(table, headers=headers, tablefmt="simple") + "\n")
     for note in notes:
         print(note)
