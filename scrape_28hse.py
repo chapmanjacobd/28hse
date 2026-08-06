@@ -102,8 +102,37 @@ EMAIL_PATTERN = re.compile(
     r"(?i)(?<![A-Za-z0-9_.+-])[A-Za-z0-9_.+-]+@"
     r"(?:[A-Za-z0-9-]+\.)+[a-z]{2,}(?![A-Za-z0-9.-])"
 )
+PHONE_DIGIT_CHARS = (
+    "0123456789"
+    "０１２３４５６７８９"
+    "零〇○"
+    "一壹壱幺么"
+    "二貳贰兩两"
+    "三參叁参弎"
+    "四肆"
+    "五伍"
+    "六陸陆"
+    "七柒"
+    "八捌"
+    "九玖"
+)
+PHONE_FIRST_DIGIT_CHARS = (
+    "23456789"
+    "２３４５６７８９"
+    "二貳贰兩两"
+    "三參叁参弎"
+    "四肆"
+    "五伍"
+    "六陸陆"
+    "七柒"
+    "八捌"
+    "九玖"
+)
 PHONE_PATTERN = re.compile(
-    r"(?<!\d)(?:(?:\+|00)?852[\s().-]*)?[2-9](?:[\s().-]*\d){7}(?!\d)"
+    rf"(?<![{PHONE_DIGIT_CHARS}])"
+    rf"(?:(?:\+|00)?852[\s().-]*)?"
+    rf"[{PHONE_FIRST_DIGIT_CHARS}](?:[\s().-]*[{PHONE_DIGIT_CHARS}]){{7}}"
+    rf"(?![{PHONE_DIGIT_CHARS}])"
 )
 SOCIAL_USERNAME_PATTERN = re.compile(
     r"(?i)(?<![A-Za-z0-9])(?P<prefix>"
