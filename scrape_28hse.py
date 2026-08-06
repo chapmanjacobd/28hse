@@ -6,18 +6,22 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import logging
 import os
 import re
 import sys
 import time
+import types
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Self
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 from bs4 import BeautifulSoup
+
+LOG = logging.getLogger(__name__)
 
 
 BASE_URL = "https://www.28hse.com/rent/apartment"
@@ -186,8 +190,7 @@ AMBIGUOUS_MARKERS = frozenset(
 # 2-bedroom layouts (兩房一廳, 2房1廳, ...): usually a whole flat, but
 # sometimes only one room of it is being rented.
 ROOM_LAYOUT_PATTERN = re.compile(
-    r"[2２兩二]\s*房\s*"
-    r"[0-9０-９一二兩三四五六七八九十]+\s*廳"
+    r"[2２兩二]\s*房\s*[0-9０-９一二兩三四五六七八九十]+\s*廳"
 )
 
 # 28Hse exposes preset buckets. Detail-page filters are enforced locally so
@@ -364,7 +367,7 @@ def parse_listing(card: BeautifulSoup, fetched_at: str) -> dict[str, Any] | None
     area_node = card.select_one("div.areaUnitPrice")
     room_node = card.select_one("div.extra div.tagLabels div.ui.label")
     if price_node is None or area_node is None or room_node is None:
-        print(f"warning: incomplete listing card skipped: {url}", file=sys.stderr)
+        LOG.debug("incomplete listing card skipped: %s", url)
         return None
 
     price = first_match(price_node.get_text(" ", strip=True), r"\$([\d,]+)")
@@ -373,7 +376,7 @@ def parse_listing(card: BeautifulSoup, fetched_at: str) -> dict[str, Any] | None
     bedrooms = first_match(room_text, r"(\d+)\s*房")
     bathrooms = first_match(room_text, r"(\d+)\s*浴室")
     if price is None or area is None or bedrooms is None:
-        print(f"warning: unparseable listing card skipped: {url}", file=sys.stderr)
+        LOG.debug("unparseable listing card skipped: %s", url)
         return None
 
     title_link = card.select_one('div.header a.detail_page[href*="/property-"]') or link
@@ -381,25 +384,21 @@ def parse_listing(card: BeautifulSoup, fetched_at: str) -> dict[str, Any] | None
     image = card.select_one("img.detail_page_img")
     agency_node = card.select_one("div.companyName")
     property_type = (
-        district_links[1].get_text(" ", strip=True)
-        if len(district_links) > 1
-        else ""
+        district_links[1].get_text(" ", strip=True) if len(district_links) > 1 else ""
     )
 
     return {
         "listing_id": listing_id,
         "title": title_link.get_text(" ", strip=True),
-        "district": district_links[0].get_text(" ", strip=True)
-        if district_links
-        else "",
+        "district": (
+            district_links[0].get_text(" ", strip=True) if district_links else ""
+        ),
         "property_type": property_type,
         "price_hkd": price,
         "usable_area_sqft": area,
         "bedrooms": bedrooms,
         "bathrooms": bathrooms or "",
-        "agency": agency_node.get_text(" ", strip=True)
-        if agency_node
-        else "",
+        "agency": agency_node.get_text(" ", strip=True) if agency_node else "",
         "image_url": image.get("src", "") if image else "",
         "url": url,
         "fetched_at": fetched_at,
@@ -513,8 +512,7 @@ def parse_listing_details(soup: BeautifulSoup) -> dict[str, Any]:
             if not isinstance(href, str):
                 continue
             match = re.search(
-                r"initNearbyMap\(\s*(-?\d+(?:\.\d+)?)\s*,\s*"
-                r"(-?\d+(?:\.\d+)?)",
+                r"initNearbyMap\(\s*(-?\d+(?:\.\d+)?)\s*,\s*" r"(-?\d+(?:\.\d+)?)",
                 href,
             )
             if match:
@@ -577,9 +575,7 @@ def classify_sharing(listing: dict[str, Any]) -> tuple[str, list[str]]:
         text = text.replace(phrase, "")
 
     shared_terms = [
-        label
-        for pattern, label in SHARED_PATTERNS
-        if re.search(pattern, text)
+        label for pattern, label in SHARED_PATTERNS if re.search(pattern, text)
     ]
     if shared_terms:
         return "shared", shared_terms
@@ -602,52 +598,106 @@ def classify_sharing(listing: dict[str, Any]) -> tuple[str, list[str]]:
 def matches_card_filters(listing: dict[str, Any]) -> bool:
     return (
         MIN_RENT_HKD <= int(listing["price_hkd"]) <= MAX_RENT_HKD
-        and MIN_AREA_SQFT
-        <= int(listing["usable_area_sqft"])
-        <= MAX_AREA_SQFT
+        and MIN_AREA_SQFT <= int(listing["usable_area_sqft"]) <= MAX_AREA_SQFT
         and MIN_BEDROOMS <= int(listing["bedrooms"]) <= MAX_BEDROOMS
         and district_is_allowed(str(listing["district"]))
         and not property_type_is_excluded(str(listing["property_type"]))
     )
 
 
-def matches_filters(listing: dict[str, Any]) -> bool:
+def filter_rejections(listing: dict[str, Any]) -> list[str]:
+    """Return human-readable reasons a listing fails the detail filters."""
+    reasons: list[str] = []
+
+    try:
+        price = int(listing["price_hkd"])
+    except (KeyError, TypeError, ValueError):
+        reasons.append("price is unparseable")
+    else:
+        if not MIN_RENT_HKD <= price <= MAX_RENT_HKD:
+            reasons.append(
+                f"price HK${price:,} outside HK${MIN_RENT_HKD:,}-{MAX_RENT_HKD:,}"
+            )
+
+    try:
+        area = int(listing["usable_area_sqft"])
+    except (KeyError, TypeError, ValueError):
+        reasons.append("usable area is unparseable")
+    else:
+        if not MIN_AREA_SQFT <= area <= MAX_AREA_SQFT:
+            reasons.append(
+                f"usable area {area} sqft outside {MIN_AREA_SQFT}-{MAX_AREA_SQFT}"
+            )
+
+    try:
+        bedrooms = int(listing["bedrooms"])
+    except (KeyError, TypeError, ValueError):
+        reasons.append("bedrooms is unparseable")
+    else:
+        if not MIN_BEDROOMS <= bedrooms <= MAX_BEDROOMS:
+            reasons.append(f"bedrooms {bedrooms} outside {MIN_BEDROOMS}-{MAX_BEDROOMS}")
+
+    district = str(listing.get("district", ""))
+    if not district_is_allowed(district):
+        reasons.append(f"district {district!r} not in the allowed list")
+    property_type = str(listing.get("property_type", ""))
+    if property_type_is_excluded(property_type):
+        reasons.append(f"property type {property_type!r} is excluded")
+
+    floor = normalized_detail_value(listing.get("floor"))
+    if not is_unknown_detail_value(floor) and floor not in ALLOWED_FLOORS:
+        reasons.append(f"floor {floor!r} is not a middle/high floor")
+    kitchen_type = normalized_detail_value(listing.get("kitchen_type"))
+    if not is_unknown_detail_value(kitchen_type) and kitchen_type != OPEN_KITCHEN:
+        reasons.append(f"kitchen type {kitchen_type!r} is not an open kitchen")
+
+    sharing_type, sharing_terms = classify_sharing(listing)
+    if sharing_type == "shared":
+        reasons.append(
+            f"shared rental (matched: {', '.join(sharing_terms) or 'unknown'})"
+        )
+
     building_age = listing.get("building_age_years")
     if not is_unknown_detail_value(building_age):
         try:
-            building_age = int(building_age)
+            building_age_int = int(building_age)
         except (TypeError, ValueError):
-            return False
-        age_matches = building_age < MAX_BUILDING_AGE_YEARS
-    else:
-        age_matches = True
+            reasons.append(f"building age {building_age!r} is not a number")
+        else:
+            if building_age_int >= MAX_BUILDING_AGE_YEARS:
+                reasons.append(
+                    f"building age {building_age_int} years is not under "
+                    f"{MAX_BUILDING_AGE_YEARS}"
+                )
 
-    floor = normalized_detail_value(listing.get("floor"))
-    kitchen_type = normalized_detail_value(listing.get("kitchen_type"))
     building_area = listing.get("building_area_sqft")
-    sharing_type, _ = classify_sharing(listing)
-    if is_unknown_detail_value(building_area):
-        area_matches = True
-    else:
+    if not is_unknown_detail_value(building_area):
         try:
-            building_area = int(building_area)
+            building_area_int = int(building_area)
         except (TypeError, ValueError):
-            return False
-        area_matches = building_area >= MIN_AREA_SQFT
-    return (
-        matches_card_filters(listing)
-        and (is_unknown_detail_value(floor) or floor in ALLOWED_FLOORS)
-        and (
-            is_unknown_detail_value(kitchen_type)
-            or kitchen_type == OPEN_KITCHEN
-        )
-        and sharing_type != "shared"
-        and age_matches
-        and area_matches
-    )
+            reasons.append(f"building area {building_area!r} is not a number")
+        else:
+            if building_area_int < MIN_AREA_SQFT:
+                reasons.append(
+                    f"building area {building_area_int} sqft is under {MIN_AREA_SQFT}"
+                )
+
+    return reasons
+
+
+def matches_filters(listing: dict[str, Any]) -> bool:
+    return not filter_rejections(listing)
 
 
 class IncrementalCsvWriter:
+
+    def _sync(self) -> None:
+        self.output.flush()
+        try:
+            os.fsync(self.output.fileno())
+        except OSError as exc:
+            raise RuntimeError(f"Unable to persist {self.path}: {exc}") from exc
+
     def __init__(self, path: Path, fieldnames: list[str]) -> None:
         self.path = path
         self.fieldnames = fieldnames
@@ -672,13 +722,6 @@ class IncrementalCsvWriter:
             self.output.flush()
             self._sync()
 
-    def _sync(self) -> None:
-        self.output.flush()
-        try:
-            os.fsync(self.output.fileno())
-        except OSError as exc:
-            raise RuntimeError(f"Unable to persist {self.path}: {exc}") from exc
-
     def append(self, row: dict[str, Any]) -> bool:
         listing_id = str(row["listing_id"])
         if listing_id in self.existing_ids:
@@ -691,10 +734,15 @@ class IncrementalCsvWriter:
     def close(self) -> None:
         self.output.close()
 
-    def __enter__(self) -> "IncrementalCsvWriter":
+    def __enter__(self) -> Self:
         return self
 
-    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: types.TracebackType | None,
+    ) -> None:
         self.close()
 
 
@@ -712,13 +760,8 @@ class SeenSet:
         self._ids: set[str] = set()
         if self.path.exists():
             with self.path.open("r", encoding="utf-8") as source:
-                self._ids.update(
-                    line.strip() for line in source if line.strip()
-                )
+                self._ids.update(line.strip() for line in source if line.strip())
         self._output = self.path.open("a", encoding="utf-8")
-
-    def __contains__(self, listing_id: str) -> bool:
-        return listing_id in self._ids
 
     def add(self, listing_id: str) -> None:
         if listing_id in self._ids:
@@ -730,10 +773,18 @@ class SeenSet:
     def close(self) -> None:
         self._output.close()
 
-    def __enter__(self) -> "SeenSet":
+    def __contains__(self, listing_id: str) -> bool:
+        return listing_id in self._ids
+
+    def __enter__(self) -> Self:
         return self
 
-    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: types.TracebackType | None,
+    ) -> None:
         self.close()
 
 
@@ -763,12 +814,11 @@ def scrape(
             page = 1
             total_items: int | None = None
             stop_district = False
-            while (
-                (max_pages is None or page <= max_pages)
-                and (page_limit is None or pages_scraped < page_limit)
+            while (max_pages is None or page <= max_pages) and (
+                page_limit is None or pages_scraped < page_limit
             ):
                 url = build_url(page, district_url)
-                print(f"downloading page {page}: {url}", file=sys.stderr)
+                LOG.debug("downloading page %s: %s", page, url)
                 soup = BeautifulSoup(fetch_html(url), "html.parser")
                 pages_scraped += 1
                 cards = soup.select("div.listItems div.property_item")
@@ -777,18 +827,16 @@ def scrape(
                 except RuntimeError:
                     if cards:
                         raise
-                    print(
-                        f"no listings in district scope: {district_url}",
-                        file=sys.stderr,
-                    )
+                    LOG.warning("no listings in district scope: %s", district_url)
                     break
 
                 if total_items is None:
                     total_items = int(item_list["numberOfItems"])
                     total_pages = (total_items + PAGE_SIZE - 1) // PAGE_SIZE
-                    print(
-                        f"candidate listings: {total_items}; pages: {total_pages}",
-                        file=sys.stderr,
+                    LOG.debug(
+                        "candidate listings: %s; pages: %s",
+                        total_items,
+                        total_pages,
                     )
 
                 unparseable_card = False
@@ -803,26 +851,41 @@ def scrape(
                         seen.add(listing_id)
 
                     listing = parse_listing(card, fetched_at)
-                    if listing is not None and matches_card_filters(listing):
-                        if output.append(listing):
-                            new_candidates += 1
+                    if (
+                        listing is not None
+                        and matches_card_filters(listing)
+                        and output.append(listing)
+                    ):
+                        new_candidates += 1
 
                 if cards and not unparseable_card and page_unseen == 0:
-                    print(
-                        f"all {len(cards)} listings on page {page} already seen; "
-                        f"stopping district: {district_url}",
-                        file=sys.stderr,
+                    LOG.debug(
+                        "all %s listings on page %s already seen; "
+                        "stopping district: %s",
+                        len(cards),
+                        page,
+                        district_url,
                     )
                     stop_district = True
 
-                if stop_district or not cards or (
-                    total_items is not None and page * PAGE_SIZE >= total_items
+                if (
+                    stop_district
+                    or not cards
+                    or (total_items is not None and page * PAGE_SIZE >= total_items)
                 ):
                     break
                 page += 1
                 time.sleep(REQUEST_DELAY_SECONDS)
 
     return new_candidates
+
+
+def write_csv(path: Path, listings: list[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="") as output:
+        writer = csv.DictWriter(output, fieldnames=OUTPUT_FIELDS)
+        writer.writeheader()
+        writer.writerows(listings)
 
 
 def enrich(
@@ -834,6 +897,7 @@ def enrich(
         raise RuntimeError("--output and --cache must be different paths")
     candidates = read_csv_rows(candidates_path)
     new_enriched = 0
+    newly_enriched: set[str] = set()
     seen_path = candidates_path.with_name(candidates_path.stem + "_enrich_seen.txt")
     with SeenSet(seen_path) as seen, IncrementalCsvWriter(
         cache_path, CSV_FIELDS
@@ -847,29 +911,28 @@ def enrich(
 
             url = candidate.get("url", "")
             if not url:
-                print(
-                    f"warning: candidate {listing_id} has no detail URL",
-                    file=sys.stderr,
-                )
+                LOG.debug("candidate %s has no detail URL; not enriched", listing_id)
                 seen.add(listing_id)
                 continue
 
-            print(f"enriching listing {listing_id}: {url}", file=sys.stderr)
+            LOG.debug("enriching listing %s: %s", listing_id, url)
             detail_soup = BeautifulSoup(fetch_html(url), "html.parser")
             seen.add(listing_id)
             if parse_json_ld(detail_soup) is None:
-                print(
-                    f"warning: listing {listing_id} no longer available "
-                    f"(detail URL redirected to a non-property page): {url}",
-                    file=sys.stderr,
+                LOG.debug(
+                    "listing %s no longer available; not enriched "
+                    "(detail URL redirected to a non-property page): %s",
+                    listing_id,
+                    url,
                 )
                 time.sleep(REQUEST_DELAY_SECONDS)
                 continue
             details = parse_listing_details(detail_soup)
             if not details:
-                print(
-                    f"warning: no listing details found: {url}",
-                    file=sys.stderr,
+                LOG.debug(
+                    "no listing details found for %s; not enriched: %s",
+                    listing_id,
+                    url,
                 )
                 time.sleep(REQUEST_DELAY_SECONDS)
                 continue
@@ -879,12 +942,19 @@ def enrich(
             listing["enriched_at"] = datetime.now(timezone.utc).isoformat()
             if cache.append(listing):
                 new_enriched += 1
+                newly_enriched.add(listing_id)
             time.sleep(REQUEST_DELAY_SECONDS)
 
     enriched_rows = read_csv_rows(cache_path)
     matches: list[dict[str, Any]] = []
     for listing in enriched_rows:
-        if not matches_filters(listing):
+        rejections = filter_rejections(listing)
+        if rejections:
+            listing_id = listing.get("listing_id", "")
+            if listing_id in newly_enriched:
+                LOG.info(
+                    "%s filtered out: %s", listing.get("url", ""), "; ".join(rejections)
+                )
             continue
         sharing_type, sharing_terms = classify_sharing(listing)
         listing["sharing_type"] = sharing_type
@@ -899,14 +969,6 @@ def enrich(
     )
     write_csv(output_path, matches)
     return new_enriched
-
-
-def write_csv(path: Path, listings: list[dict[str, Any]]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8", newline="") as output:
-        writer = csv.DictWriter(output, fieldnames=OUTPUT_FIELDS)
-        writer.writeheader()
-        writer.writerows(listings)
 
 
 def main() -> None:
@@ -946,17 +1008,31 @@ def main() -> None:
         type=int,
         help="limit total listing pages across all districts",
     )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="count",
+        default=0,
+        help="increase logging verbosity; repeat for more detail "
+        "(-v info, -vv debug)",
+    )
     args = parser.parse_args()
     if args.max_pages is not None and args.max_pages < 1:
         parser.error("--max-pages must be at least 1")
     if args.limit is not None and args.limit < 1:
         parser.error("--limit must be at least 1")
 
+    logging.basicConfig(
+        level={
+            0: logging.WARNING,
+            1: logging.INFO,
+        }.get(args.verbose, logging.DEBUG),
+        format="%(levelname)s: %(message)s",
+    )
+
     if args.stage in ("all", "scrape"):
         new_candidates = scrape(args.max_pages, args.candidates, args.limit)
-        print(
-            f"saved {new_candidates} new card-filtered listings to {args.candidates}"
-        )
+        print(f"saved {new_candidates} new card-filtered listings to {args.candidates}")
 
     if args.stage in ("all", "enrich"):
         new_enriched = enrich(args.candidates, args.output, args.cache)

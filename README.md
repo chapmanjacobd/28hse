@@ -82,3 +82,9 @@ so an interrupted run can be resumed safely. Use `--limit 1` with the
 `scrape` stage to fetch exactly one page total, or `--max-pages 1` to fetch
 one page per district. Use `--candidates`, `--cache`, and `--output` to choose
 different paths.
+
+Progress and diagnostic messages go through the `logging` module to stderr.
+By default only warnings are shown; `-v` additionally shows info messages
+(e.g. why a newly enriched listing was filtered out of the output CSV) and
+`-vv` also shows debug messages (e.g. each page downloaded, and why a listing
+could not be enriched).
