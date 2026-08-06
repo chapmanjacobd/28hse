@@ -23,7 +23,7 @@ public listing pages and applies these filters:
 - 1, 2, or 3 bedrooms
 - building age under 30 years when reported
 - HK$7,000 through HK$17,000 monthly rent
-- 400 through 900 sqft usable area
+- 350 through 900 sqft usable area
 
 The scraper visits each requested district URL separately, using the site's
 rent, area, bedroom buckets, and latest-first ordering to reduce crawling
