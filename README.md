@@ -72,8 +72,9 @@ image URLs when present.
 
 ```sh
 python3 -m pip install -r requirements.txt
-python3 scrape_28hse.py scrape
-python3 scrape_28hse.py enrich
+python3 scrape_28hse.py -v
+
+git diff data/28hse_rentals.csv | xsv select 14
 ```
 
 The default output is `data/28hse_rentals.csv`. Running the script without a
