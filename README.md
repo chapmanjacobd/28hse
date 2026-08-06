@@ -69,6 +69,9 @@ them as already attempted so they are skipped on later runs.
 The detail data includes coordinates, address, description, estate, building
 area, rent inclusions, cooking method, school nets, listing dates, and all
 image URLs when present.
+Email addresses, phone-like values, and labeled WeChat, Instagram, or WhatsApp
+usernames are removed from text fields before rows are written. Existing
+tracked CSV rows have also been scrubbed.
 
 ```sh
 python3 -m pip install -r requirements.txt

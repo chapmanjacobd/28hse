@@ -78,6 +78,38 @@ OPEN_KITCHEN = "開放式廚房"
 UNKNOWN_DETAIL_VALUES = frozenset(
     {"", "-", "--", "—", "－", "n/a", "na", "null", "none"}
 )
+CONTACT_TEXT_FIELDS = frozenset(
+    {
+        "title",
+        "district",
+        "property_type",
+        "floor",
+        "kitchen_type",
+        "agency",
+        "estate",
+        "address",
+        "description",
+        "rent_includes",
+        "subletting",
+        "cooking_method",
+        "primary_school_net",
+        "secondary_school_net",
+        "sharing_type",
+        "sharing_terms",
+    }
+)
+EMAIL_PATTERN = re.compile(
+    r"(?i)(?<![A-Za-z0-9_.+-])[A-Za-z0-9_.+-]+@"
+    r"(?:[A-Za-z0-9-]+\.)+[a-z]{2,}(?![A-Za-z0-9.-])"
+)
+PHONE_PATTERN = re.compile(
+    r"(?<!\d)(?:(?:\+|00)?852[\s().-]*)?[2-9](?:[\s().-]*\d){7}(?!\d)"
+)
+SOCIAL_USERNAME_PATTERN = re.compile(
+    r"(?i)(?<![A-Za-z0-9])(?P<prefix>"
+    r"(?:wechat|whatsapp|instagram|微信)\s*(?:[:：=]\s*[-–—]?\s*|[-–—]\s+)"
+    r")(?P<username>[A-Za-z0-9][A-Za-z0-9_.-]*)(?![A-Za-z0-9_.-])"
+)
 ALLOWED_DISTRICTS = frozenset(
     {
         "中環",
@@ -259,6 +291,28 @@ DEFAULT_CANDIDATES_PATH = Path("data/28hse_candidates.csv")
 DEFAULT_ENRICHED_CACHE_PATH = Path("data/28hse_enriched.csv")
 
 
+def strip_contact_info(value: Any, field: str | None = None) -> Any:
+    """Remove contact details and social-media usernames from CSV text fields."""
+    if not isinstance(value, str):
+        return value
+
+    sanitized = EMAIL_PATTERN.sub("[REDACTED]", value)
+    if field in CONTACT_TEXT_FIELDS:
+        sanitized = PHONE_PATTERN.sub("[REDACTED]", sanitized)
+        sanitized = SOCIAL_USERNAME_PATTERN.sub(
+            lambda match: f"{match.group('prefix')}[REDACTED]",
+            sanitized,
+        )
+    return sanitized
+
+
+def sanitize_row(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        field: strip_contact_info(value, field)
+        for field, value in row.items()
+    }
+
+
 def build_url(page: int, base_url: str = BASE_URL) -> str:
     path = base_url if page == 1 else f"{base_url}/page-{page}"
     return f"{path}?{urlencode(SEARCH_PARAMS)}"
@@ -387,7 +441,7 @@ def parse_listing(card: BeautifulSoup, fetched_at: str) -> dict[str, Any] | None
         district_links[1].get_text(" ", strip=True) if len(district_links) > 1 else ""
     )
 
-    return {
+    return sanitize_row({
         "listing_id": listing_id,
         "title": title_link.get_text(" ", strip=True),
         "district": (
@@ -402,7 +456,7 @@ def parse_listing(card: BeautifulSoup, fetched_at: str) -> dict[str, Any] | None
         "image_url": image.get("src", "") if image else "",
         "url": url,
         "fetched_at": fetched_at,
-    }
+    })
 
 
 def parse_property_types(soup: BeautifulSoup) -> str:
@@ -531,7 +585,7 @@ def parse_listing_details(soup: BeautifulSoup) -> dict[str, Any]:
     if subletting:
         details["subletting"] = subletting
 
-    return details
+    return sanitize_row(details)
 
 
 def district_is_allowed(district: str) -> bool:
@@ -711,9 +765,20 @@ class IncrementalCsvWriter:
                     raise RuntimeError(
                         f"{path} has an incompatible CSV header; use a new path"
                     )
-                self.existing_ids = {
-                    row["listing_id"] for row in reader if row.get("listing_id")
-                }
+                existing_rows = list(reader)
+            sanitized_rows = [sanitize_row(row) for row in existing_rows]
+            if sanitized_rows != existing_rows:
+                temporary_path = self.path.with_name(f".{self.path.name}.tmp")
+                with temporary_path.open("w", encoding="utf-8", newline="") as output:
+                    writer = csv.DictWriter(output, fieldnames=fieldnames)
+                    writer.writeheader()
+                    writer.writerows(sanitized_rows)
+                    output.flush()
+                    os.fsync(output.fileno())
+                os.replace(temporary_path, self.path)
+            self.existing_ids = {
+                row["listing_id"] for row in sanitized_rows if row.get("listing_id")
+            }
 
         self.output = self.path.open("a", encoding="utf-8", newline="")
         self.writer = csv.DictWriter(self.output, fieldnames=fieldnames)
@@ -726,7 +791,10 @@ class IncrementalCsvWriter:
         listing_id = str(row["listing_id"])
         if listing_id in self.existing_ids:
             return False
-        self.writer.writerow({field: row.get(field, "") for field in self.fieldnames})
+        sanitized_row = sanitize_row(row)
+        self.writer.writerow(
+            {field: sanitized_row.get(field, "") for field in self.fieldnames}
+        )
         self._sync()
         self.existing_ids.add(listing_id)
         return True
@@ -792,7 +860,7 @@ def read_csv_rows(path: Path) -> list[dict[str, str]]:
     if not path.exists():
         raise RuntimeError(f"CSV input does not exist: {path}")
     with path.open("r", encoding="utf-8", newline="") as source:
-        return list(csv.DictReader(source))
+        return [sanitize_row(row) for row in csv.DictReader(source)]
 
 
 def scrape(
@@ -885,7 +953,7 @@ def write_csv(path: Path, listings: list[dict[str, Any]]) -> None:
     with path.open("w", encoding="utf-8", newline="") as output:
         writer = csv.DictWriter(output, fieldnames=OUTPUT_FIELDS)
         writer.writeheader()
-        writer.writerows(listings)
+        writer.writerows(sanitize_row(listing) for listing in listings)
 
 
 def enrich(
