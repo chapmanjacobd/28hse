@@ -61,6 +61,11 @@ stores card-filtered candidates incrementally in
 detail-page data in `data/28hse_enriched.csv` and regenerates the filtered
 output. Available data is retained even when a listing omits one of the
 filter-specific fields.
+Enrichment attempts are also recorded in a sidecar file next to the candidates
+CSV (`data/28hse_candidates_enrich_seen.txt`). Listings whose detail page has
+disappeared or no longer resolves to a property are never written to the cache,
+so without this file they would be re-fetched on every run; the sidecar marks
+them as already attempted so they are skipped on later runs.
 The detail data includes coordinates, address, description, estate, building
 area, rent inclusions, cooking method, school nets, listing dates, and all
 image URLs when present.

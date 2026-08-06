@@ -834,10 +834,15 @@ def enrich(
         raise RuntimeError("--output and --cache must be different paths")
     candidates = read_csv_rows(candidates_path)
     new_enriched = 0
-    with IncrementalCsvWriter(cache_path, CSV_FIELDS) as cache:
+    seen_path = candidates_path.with_name(candidates_path.stem + "_enrich_seen.txt")
+    with SeenSet(seen_path) as seen, IncrementalCsvWriter(
+        cache_path, CSV_FIELDS
+    ) as cache:
         for candidate in candidates:
             listing_id = candidate.get("listing_id", "")
             if not listing_id or listing_id in cache.existing_ids:
+                continue
+            if listing_id in seen:
                 continue
 
             url = candidate.get("url", "")
@@ -846,10 +851,12 @@ def enrich(
                     f"warning: candidate {listing_id} has no detail URL",
                     file=sys.stderr,
                 )
+                seen.add(listing_id)
                 continue
 
             print(f"enriching listing {listing_id}: {url}", file=sys.stderr)
             detail_soup = BeautifulSoup(fetch_html(url), "html.parser")
+            seen.add(listing_id)
             if parse_json_ld(detail_soup) is None:
                 print(
                     f"warning: listing {listing_id} no longer available "
