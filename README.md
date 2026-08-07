@@ -93,7 +93,7 @@ different paths.
 
 `--mode buy` crawls sales listings instead of rentals. It reuses the same
 district, area, bedroom, floor, kitchen, building-age, and property-type
-filters, but targets a sale price of HK$2,000,000 through HK$12,000,000 and
+filters, but targets a sale price of HK$800,000 through HK$4,800,000 and
 parses the `售 $798 萬元` / `售 $1.3 億元` card prices into HKD. Its default
 files are `data/28hse_buy_candidates.csv`, `data/28hse_buy_enriched.csv`, and
 `data/28hse_buy.csv`. The rent-specific fields (`rent_includes`,
